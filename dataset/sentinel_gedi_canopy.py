@@ -66,6 +66,9 @@ class GediSentinelDataset(Dataset):
                 gedi_path = os.path.join(self.gedi_folder, gedi_paths_all[i])
                 gedi = np.load(gedi_path)
 
+                sentinel_path = os.path.join(self.sentinel_folder, sentinel_paths_all[i])
+                sentinel = np.load(sentinel_path)
+
                 # Originally exclude the patches with not enough points for GSenNet
                 # if np.sum(~np.isnan(gedi)) >= 50:
 
@@ -74,6 +77,7 @@ class GediSentinelDataset(Dataset):
                     # print("GEDI points in patch", gedi_paths_all[i], ":", np.sum(~np.isnan(gedi)))
                     if np.sum(~np.isnan(gedi)) > 0:
                         print("Include patch", gedi_paths_all[i], "Num GEDI points:", np.sum(~np.isnan(gedi)))
+                        print("Number of Sentinel points:", np.sum(~np.isnan(sentinel)))
                         self.gedi_paths.append(gedi_paths_all[i])
                         self.sentinel_paths.append(sentinel_paths_all[i])
                 # include all patches for prediction
