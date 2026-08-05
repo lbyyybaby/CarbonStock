@@ -71,6 +71,7 @@ class GediSentinelDataset(Dataset):
 
                 # only include patches with GEDI point for training
                 if not self.predict:
+                    print("GEDI points in patch", gedi_paths_all[i], ":", np.sum(~np.isnan(gedi)))
                     if np.sum(~np.isnan(gedi)) > 0:
                         self.gedi_paths.append(gedi_paths_all[i])
                         self.sentinel_paths.append(sentinel_paths_all[i])
