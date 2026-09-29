@@ -21,18 +21,18 @@ def _make_fusion_block(features, use_bn, size=None):
     )
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_feature, out_feature):
-        super().__init__()
+# class ConvBlock(nn.Module):
+#     def __init__(self, in_feature, out_feature):
+#         super().__init__()
 
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(in_feature, out_feature, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_feature),
-            nn.ReLU(True),
-        )
+#         self.conv_block = nn.Sequential(
+#             nn.Conv2d(in_feature, out_feature, kernel_size=3, stride=1, padding=1),
+#             nn.BatchNorm2d(out_feature),
+#             nn.ReLU(True),
+#         )
 
-    def forward(self, x):
-        return self.conv_block(x)
+#     def forward(self, x):
+#         return self.conv_block(x)
 
 
 class DPTHead(nn.Module):
@@ -174,6 +174,7 @@ class DepthAnythingV2(nn.Module):
     def __init__(
         self,
         encoder="vitl",
+        in_channels=14,
         features=256,
         out_channels=[256, 512, 1024, 1024],
         use_bn=False,
@@ -189,7 +190,7 @@ class DepthAnythingV2(nn.Module):
         }
 
         self.encoder = encoder
-        self.pretrained = DINOv2(model_name=encoder)
+        self.pretrained = DINOv2(model_name=encoder, in_chans=in_channels)
 
         self.depth_head = DPTHead(
             self.pretrained.embed_dim,
@@ -257,90 +258,90 @@ class DepthAnythingV2(nn.Module):
         return image, (h, w)
 
 
-class MetricDepthAnythingV2(nn.Module):
-    def __init__(
-        self,
-        encoder="vitl",
-        features=256,
-        out_channels=[256, 512, 1024, 1024],
-        use_bn=False,
-        use_clstoken=False,
-        max_depth=20.0,
-    ):
-        super(MetricDepthAnythingV2, self).__init__()
+# class MetricDepthAnythingV2(nn.Module):
+#     def __init__(
+#         self,
+#         encoder="vitl",
+#         features=256,
+#         out_channels=[256, 512, 1024, 1024],
+#         use_bn=False,
+#         use_clstoken=False,
+#         max_depth=20.0,
+#     ):
+#         super(MetricDepthAnythingV2, self).__init__()
 
-        self.intermediate_layer_idx = {
-            "vits": [2, 5, 8, 11],
-            "vitb": [2, 5, 8, 11],
-            "vitl": [4, 11, 17, 23],
-            "vitg": [9, 19, 29, 39],
-        }
+#         self.intermediate_layer_idx = {
+#             "vits": [2, 5, 8, 11],
+#             "vitb": [2, 5, 8, 11],
+#             "vitl": [4, 11, 17, 23],
+#             "vitg": [9, 19, 29, 39],
+#         }
 
-        self.max_depth = max_depth
+#         self.max_depth = max_depth
 
-        self.encoder = encoder
-        self.pretrained = DINOv2(model_name=encoder)
+#         self.encoder = encoder
+#         self.pretrained = DINOv2(model_name=encoder)
 
-        self.depth_head = DPTHead(
-            self.pretrained.embed_dim,
-            features,
-            use_bn,
-            out_channels=out_channels,
-            use_clstoken=use_clstoken,
-        )
+#         self.depth_head = DPTHead(
+#             self.pretrained.embed_dim,
+#             features,
+#             use_bn,
+#             out_channels=out_channels,
+#             use_clstoken=use_clstoken,
+#         )
 
-    def forward(self, x):
-        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+#     def forward(self, x):
+#         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
 
-        features = self.pretrained.get_intermediate_layers(
-            x, self.intermediate_layer_idx[self.encoder], return_class_token=True
-        )
+#         features = self.pretrained.get_intermediate_layers(
+#             x, self.intermediate_layer_idx[self.encoder], return_class_token=True
+#         )
 
-        depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
+#         depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
 
-        return depth.squeeze(1)
+#         return depth.squeeze(1)
 
-    @torch.no_grad()
-    def infer_image(self, raw_image, input_size=518):
-        image, (h, w) = self.image2tensor(raw_image, input_size)
+#     @torch.no_grad()
+#     def infer_image(self, raw_image, input_size=518):
+#         image, (h, w) = self.image2tensor(raw_image, input_size)
 
-        depth = self.forward(image)
+#         depth = self.forward(image)
 
-        depth = F.interpolate(
-            depth[:, None], (h, w), mode="bilinear", align_corners=True
-        )[0, 0]
+#         depth = F.interpolate(
+#             depth[:, None], (h, w), mode="bilinear", align_corners=True
+#         )[0, 0]
 
-        return depth.cpu().numpy()
+#         return depth.cpu().numpy()
 
-    def image2tensor(self, raw_image, input_size=518):
-        transform = Compose(
-            [
-                Resize(
-                    width=input_size,
-                    height=input_size,
-                    resize_target=False,
-                    keep_aspect_ratio=True,
-                    ensure_multiple_of=14,
-                    resize_method="lower_bound",
-                    image_interpolation_method=cv2.INTER_CUBIC,
-                ),
-                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                PrepareForNet(),
-            ]
-        )
+#     def image2tensor(self, raw_image, input_size=518):
+#         transform = Compose(
+#             [
+#                 Resize(
+#                     width=input_size,
+#                     height=input_size,
+#                     resize_target=False,
+#                     keep_aspect_ratio=True,
+#                     ensure_multiple_of=14,
+#                     resize_method="lower_bound",
+#                     image_interpolation_method=cv2.INTER_CUBIC,
+#                 ),
+#                 NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+#                 PrepareForNet(),
+#             ]
+#         )
 
-        h, w = raw_image.shape[:2]
+#         h, w = raw_image.shape[:2]
 
-        image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
+#         image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
 
-        image = transform({"image": image})["image"]
-        image = torch.from_numpy(image).unsqueeze(0)
+#         image = transform({"image": image})["image"]
+#         image = torch.from_numpy(image).unsqueeze(0)
 
-        DEVICE = (
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available() else "cpu"
-        )
-        image = image.to(DEVICE)
+#         DEVICE = (
+#             "cuda"
+#             if torch.cuda.is_available()
+#             else "mps" if torch.backends.mps.is_available() else "cpu"
+#         )
+#         image = image.to(DEVICE)
 
-        return image, (h, w)
+#         return image, (h, w)

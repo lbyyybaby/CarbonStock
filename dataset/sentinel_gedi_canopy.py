@@ -1,307 +1,254 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
 import lightning as L
-import pandas as pd
 import numpy as np
-import os
-
-import matplotlib.pyplot as plt
-
-import torchvision.transforms as T
+import torch
+from torch.utils.data import DataLoader, Dataset
 
 
-# gedi_folder = "/kaggle/input/datasets/khanhtq2101/gedi-canopy-height-hoanglien/GEDI_filtered/GEDI_filtered"
-# sentinel_folder = "/kaggle/input/datasets/khanhtq2101/gedi-canopy-height-hoanglien/Sentinel-12band/Sentinel-12band"
-# regions = ["CucPhuong", "BaBe"]
+@dataclass(frozen=True)
+class PatchPair:
+    region: str
+    name: str
+    sentinel_path: Path
+    gedi_path: Path
+    valid_pixels: int
 
-# gedi_folder = "/kaggle/input/datasets/khanhtq2101/gedi-canopy-height-hoanglien/GEDI_filtered_CaMau"
-# sentinel_folder = "/kaggle/input/datasets/khanhtq2101/gedi-canopy-height-hoanglien/Sentinel_CaMau"
-# regions = ["CaMau"]
+
+def valid_gedi_mask(
+    gedi: np.ndarray, min_height: float = 0.0, max_height: float = 30.0
+) -> np.ndarray:
+    """Return pixels that represent usable GEDI canopy-height observations."""
+    return np.isfinite(gedi) & (gedi > min_height) & (gedi <= max_height)
+
+
+def _sort_key(path: Path) -> tuple[int, int | str]:
+    try:
+        return (0, int(path.stem))
+    except ValueError:
+        return (1, path.stem)
+
+def discover_patch_pairs(
+    data_root: str | Path,
+    regions: str | Sequence[str],
+    expected_channels: int,
+    min_height: float,
+    max_height: float,
+) -> list[PatchPair]:
+    """Discover and validate Sentinel/GEDI pairs by region and file name."""
+    root = Path(data_root).expanduser().resolve()
+    region_names = regions.split("-") if isinstance(regions, str) else list(regions)
+    pairs: list[PatchPair] = []
+
+    for region in region_names:
+        sentinel_dir = root / "Sentinel" / region
+        gedi_dir = root / "GEDI" / region
+        if not sentinel_dir.is_dir() or not gedi_dir.is_dir():
+            raise FileNotFoundError(
+                f"Expected data folders {sentinel_dir} and {gedi_dir}."
+            )
+
+        sentinel_files = {p.name: p for p in sentinel_dir.glob("*.npy")}
+        gedi_files = {p.name: p for p in gedi_dir.glob("*.npy")}
+        missing_sentinel = sorted(set(gedi_files) - set(sentinel_files))
+        missing_gedi = sorted(set(sentinel_files) - set(gedi_files))
+        if missing_sentinel or missing_gedi:
+            raise ValueError(
+                f"Unpaired files in region {region}: "
+                f"missing Sentinel={missing_sentinel}, missing GEDI={missing_gedi}"
+            )
+
+        for name in sorted(sentinel_files, key=lambda item: _sort_key(Path(item))):
+            sentinel_path = sentinel_files[name]
+            gedi_path = gedi_files[name]
+            sentinel = np.load(sentinel_path, mmap_mode="r")
+            gedi = np.load(gedi_path, mmap_mode="r")
+            if sentinel.ndim != 3 or sentinel.shape[0] != expected_channels:
+                raise ValueError(
+                    f"{sentinel_path} has shape {sentinel.shape}; expected "
+                    f"({expected_channels}, H, W)."
+                )
+            if gedi.ndim != 2 or tuple(sentinel.shape[-2:]) != tuple(gedi.shape):
+                raise ValueError(
+                    f"Spatial mismatch: Sentinel {sentinel.shape}, GEDI {gedi.shape} "
+                    f"for {region}/{name}."
+                )
+            valid_pixels = int(
+                valid_gedi_mask(gedi, min_height, max_height).sum()
+            )
+            pairs.append(
+                PatchPair(
+                    region=region,
+                    name=name,
+                    sentinel_path=sentinel_path,
+                    gedi_path=gedi_path,
+                    valid_pixels=valid_pixels,
+                )
+            )
+
+    if not pairs:
+        raise ValueError(f"No paired .npy patches found below {root}.")
+    return pairs
+
+
+def compute_channel_stats(
+    pairs: Iterable[PatchPair], expected_channels: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-channel statistics, excluding all-zero/no-data pixels."""
+    channel_sum = np.zeros(expected_channels, dtype=np.float64)
+    channel_squared_sum = np.zeros(expected_channels, dtype=np.float64)
+    pixel_count = 0
+
+    for pair in pairs:
+        image = np.asarray(np.load(pair.sentinel_path, mmap_mode="r"), dtype=np.float64)
+        usable = np.all(np.isfinite(image), axis=0) & np.any(image != 0, axis=0)
+        values = image[:, usable]
+        channel_sum += values.sum(axis=1)
+        channel_squared_sum += np.square(values).sum(axis=1)
+        pixel_count += values.shape[1]
+
+    if pixel_count == 0:
+        raise ValueError("No finite, non-zero Sentinel pixels are available for normalization.")
+
+    mean = channel_sum / pixel_count
+    variance = channel_squared_sum / pixel_count - np.square(mean)
+    std = np.sqrt(np.maximum(variance, 1e-12))
+    return mean.astype(np.float32), std.astype(np.float32)
+
 
 class GediSentinelDataset(Dataset):
     def __init__(
-        self, 
-        gedi_folder,
-        sentinel_folder,
-        regions,
-        mode = "train",
-        ratio_train = 0.8, 
-        predict=False,
-        all_train_data=False,
-        max_height = 30,
-    ):
-        self.regions = regions.split("-")
-        self.gedi_folder = gedi_folder
-        self.sentinel_folder = sentinel_folder
-        self.mode = mode
-        self.ratio_train = ratio_train
-        self.predict = predict
-
+        self,
+        pairs: Sequence[PatchPair],
+        mean: np.ndarray,
+        std: np.ndarray,
+        min_height: float = 0.0,
+        max_height: float = 30.0,
+    ) -> None:
+        self.pairs = list(pairs)
+        self.mean = torch.from_numpy(mean).view(-1, 1, 1)
+        self.std = torch.from_numpy(std).view(-1, 1, 1)
+        self.min_height = min_height
         self.max_height = max_height
-        self.all_train_data = all_train_data
 
-        self.sentinel_paths = []
-        self.gedi_paths = []
+    def __len__(self) -> int:
+        return len(self.pairs)
 
-        for r in self.regions:
-            # filtering patches with not enough GEDI points
-            gedi_paths_all = [
-                os.path.join(r, file_name)
-                for file_name in sorted(
-                    os.listdir(os.path.join(self.gedi_folder, r)),
-                    key=lambda x: int(os.path.splitext(x)[0])
-                )
-            ]
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        pair = self.pairs[index]
+        image_np = np.asarray(np.load(pair.sentinel_path), dtype=np.float32)
+        target_np = np.asarray(np.load(pair.gedi_path), dtype=np.float32)
+        valid_np = valid_gedi_mask(target_np, self.min_height, self.max_height)
 
-            sentinel_paths_all = [
-                os.path.join(r, file_name)
-                for file_name in sorted(
-                    os.listdir(os.path.join(self.sentinel_folder, r)),
-                    key=lambda x: int(os.path.splitext(x)[0])
-                )
-            ]
+        image = torch.from_numpy(image_np.copy())
+        target = torch.from_numpy(target_np.copy())
+        valid_mask = torch.from_numpy(valid_np.copy())
 
+        no_data = (~torch.isfinite(image)).any(dim=0) | (image != 0).logical_not().all(dim=0)
+        image = torch.where(torch.isfinite(image), image, self.mean)
+        image = (image - self.mean) / self.std
+        image[:, no_data] = 0.0
 
-            for i in range(len(gedi_paths_all)):
-                gedi_path = os.path.join(self.gedi_folder, gedi_paths_all[i])
-                gedi = np.load(gedi_path)
-
-                sentinel_path = os.path.join(self.sentinel_folder, sentinel_paths_all[i])
-                sentinel = np.load(sentinel_path)
-
-                # Originally exclude the patches with not enough points for GSenNet
-                # if np.sum(~np.isnan(gedi)) >= 50:
-
-                # only include patches with GEDI point for training
-                if not self.predict:
-                    # print("GEDI points in patch", gedi_paths_all[i], ":", np.sum(~np.isnan(gedi)))
-                    if np.sum(~np.isnan(gedi)) > 0:
-                        # print("Include patch", gedi_paths_all[i], "Num GEDI points:", np.sum(~np.isnan(gedi)))
-                        # print("Number of Sentinel points:", np.sum(~np.isnan(sentinel)))
-                        self.gedi_paths.append(gedi_paths_all[i])
-                        self.sentinel_paths.append(sentinel_paths_all[i])
-                # include all patches for prediction
-                else:
-                    self.gedi_paths.append(gedi_paths_all[i])
-                    self.sentinel_paths.append(sentinel_paths_all[i])
-
-
-        if not self.predict:
-            #Spliting data into train and test set
-            rng = np.random.default_rng(seed=42)   # fixed seed
-            # rng = np.random.default_rng(seed=2404) 
-            file_idx_all = rng.permutation(len(self.gedi_paths)) 
-            if self.mode == "train":
-                if self.all_train_data:
-                    file_idx_train = file_idx_all
-                    self.file_idx = file_idx_train
-                else:
-                    file_idx_train = file_idx_all[:int(self.ratio_train * len(self.gedi_paths))]
-                    self.file_idx = file_idx_train
-            elif self.mode == "test" or self.mode == "val":
-                file_idx_test = file_idx_all[int(self.ratio_train * len(self.gedi_paths)):]
-                self.file_idx = file_idx_test
-        else:
-            #without permutation for prediction, to keep the order of the patches
-            file_idx_all = list(range(len(self.gedi_paths)))
-            self.file_idx = file_idx_all
-        
-        print("Dataset length:", len(self.file_idx))
-
-
-    def __len__(self):
-        return len(self.file_idx)
-
-    def __getitem__(self, idx):
-        input_file_idx = self.file_idx[idx]
-
-        gedi_path = os.path.join(self.gedi_folder, self.gedi_paths[input_file_idx])
-        sentinel_path = os.path.join(self.sentinel_folder, self.sentinel_paths[input_file_idx])
-
-        gedi = np.load(gedi_path)
-        sentinel = np.load(sentinel_path)
-        
-        gedi = gedi.astype(np.float32)
-        sentinel = sentinel.astype(np.float32)
-        sentinel = sentinel.transpose(1, 2, 0)  # from CHW to HWC for PyTorch
-
-        # print(gedi.shape, sentinel.shape)
-
-
-        transpose_sentinel = T.Compose([
-                T.ToTensor(),
-                # 12 bands
-                # statistics on Cuc Phuong and Ba Be
-                # ------------
-                T.Normalize(mean=[1445.2507821473719, 1494.0496883470857, 1695.0355912679454, 1564.6835706583588, 2027.4767477712417, 3214.2947198416723, 3624.9778571404872, 3675.896774446667, 3823.0191113997635, 3810.2311611275345, 2921.714671898899, 2096.318336982956],
-                            std=[213.97085480597985, 236.57899563433898, 264.3780942144651, 334.3297911214344, 332.1163963382028, 504.0289211352316, 630.1565564561154, 696.8590235637502, 698.3457937838511, 635.1889167644749, 583.1581743442069, 504.8285260785615]
-                )
-            ])
-        transpose_gedi = T.Compose([
-            T.ToTensor()
-        ])
-
-        gedi = gedi / self.max_height
-        sentinel = transpose_sentinel(sentinel)
-        gedi = torch.from_numpy(gedi)
-
-        # print(sentinel.shape, gedi.shape)
-        # print(sentinel.dtype, gedi.dtype)
-
-        # print("Sentinel", sentinel.min(), sentinel.max())
-        # print("GEDI", gedi[~torch.isnan(gedi)].min(), gedi[~torch.isnan(gedi)].max())
-
-        sample = {
-            "image": sentinel,
-            # sentinel[1:4, :, :],  # using RGB bands only
-            "mask": gedi,
+        return {
+            "image": image,
+            "mask": target,
+            "valid_mask": valid_mask,
+            "patch_id": f"{pair.region}/{pair.name}",
         }
 
-        return sample
-
-    def plot(self, image, mask, prediction=None, show_titles=True):
-        if prediction is not None:
-            prediction = prediction.clip(0, 1).float()
-        # Convert image to [0, 1] range
-        if image.shape[0] == 12:
-            image = image[1:4, :, :]
-        image = image.float()
-        image = image - image.min()
-        image = image / image.max()
-
-        mask = mask.float()
-
-        showing_prediction = prediction is not None
-        ncols = 2 + int(showing_prediction)
-        fig, axs = plt.subplots(nrows=1, ncols=ncols, figsize=(ncols * 4, 4))
-        axs[0].imshow(image.permute(1, 2, 0))
-        axs[0].axis("off")
-        
-        im1 = axs[1].imshow(
-            mask.squeeze(), interpolation="none", cmap="Spectral_r", vmin=0, vmax=1
-        )
-        axs[1].axis("off")
-        cbar1 = plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
-        cbar1.set_label("Canopy Height (0-30m)", rotation=270, labelpad=15)
-        
-        if show_titles:
-            axs[0].set_title("Image")
-            axs[1].set_title("Mask")
-
-        if showing_prediction:
-            im2 = axs[2].imshow(
-                prediction.squeeze(),
-                interpolation="none",
-                cmap="Spectral_r",
-                vmin=0,
-                vmax=1,
-            )
-            axs[2].axis("off")
-            cbar2 = plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
-            cbar2.set_label("Canopy Height (0-30m)", rotation=270, labelpad=15)
-            if show_titles:
-                axs[2].set_title("Prediction")
-        
-        return fig
 
 class GediSentinelDataModule(L.LightningDataModule):
     def __init__(
         self,
-        regions,
-        gedi_folder,
-        sentinel_folder,
-        batch_size=4,
-        num_workers=4,
-        ratio_train=0.8,
-        all_train_data= False
-    ):
+        data_root: str,
+        regions: str | Sequence[str] = "NgocHien",
+        expected_channels: int = 14,
+        batch_size: int = 1,
+        num_workers: int = 0,
+        train_fraction: float = 0.8,
+        split_seed: int = 42,
+        min_height: float = 0.0,
+        max_height: float = 30.0,
+    ) -> None:
         super().__init__()
-
+        self.data_root = data_root
         self.regions = regions
-        self.gedi_folder = gedi_folder
-        self.sentinel_folder = sentinel_folder
-
+        self.expected_channels = expected_channels
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.ratio_train = ratio_train
+        self.train_fraction = train_fraction
+        self.split_seed = split_seed
+        self.min_height = min_height
+        self.max_height = max_height
+        self._is_ready = False
 
-        self.all_train_data = all_train_data
+    def setup(self, stage: str | None = None) -> None:
+        if self._is_ready:
+            return
 
-        print("All data in the train set:", all_train_data)
-
-    def setup(self, stage=None):
-        if stage == "fit" or stage is None:
-            self.train_dataset = GediSentinelDataset(
-                regions=self.regions,
-                gedi_folder=self.gedi_folder,
-                sentinel_folder=self.sentinel_folder,
-                mode="train",
-                ratio_train=self.ratio_train,
-                predict=False,
-                all_train_data = self.all_train_data
+        all_pairs = discover_patch_pairs(
+            self.data_root,
+            self.regions,
+            self.expected_channels,
+            self.min_height,
+            self.max_height,
+        )
+        labeled_pairs = [pair for pair in all_pairs if pair.valid_pixels > 0]
+        if len(labeled_pairs) < 2:
+            raise ValueError(
+                "At least two patches containing valid GEDI pixels are required "
+                "for a non-overlapping train/validation split."
             )
 
-            self.val_dataset = GediSentinelDataset(
-                regions=self.regions,
-                gedi_folder=self.gedi_folder,
-                sentinel_folder=self.sentinel_folder,
-                mode="val",
-                ratio_train=self.ratio_train,
-                predict=False,
-            )
+        order = np.random.default_rng(self.split_seed).permutation(len(labeled_pairs))
+        split = int(self.train_fraction * len(labeled_pairs))
+        split = min(max(split, 1), len(labeled_pairs) - 1)
+        train_pairs = [labeled_pairs[i] for i in order[:split]]
+        val_pairs = [labeled_pairs[i] for i in order[split:]]
 
-        if stage == "test" or stage is None:
-            self.test_dataset = GediSentinelDataset(
-                regions=self.regions,
-                gedi_folder=self.gedi_folder,
-                sentinel_folder=self.sentinel_folder,
-                mode="test",
-                ratio_train=self.ratio_train,
-                predict=False,
-            )
-        
-        if stage == "predict":
-            self.predict_dataset = GediSentinelDataset(
-                regions=self.regions,
-                gedi_folder=self.gedi_folder,
-                sentinel_folder=self.sentinel_folder,
-                predict=True,       # include all patches
-            )
+        mean, std = compute_channel_stats(train_pairs, self.expected_channels)
+        common = dict(
+            mean=mean,
+            std=std,
+            min_height=self.min_height,
+            max_height=self.max_height,
+        )
+        self.train_dataset = GediSentinelDataset(train_pairs, **common)
+        self.val_dataset = GediSentinelDataset(val_pairs, **common)
+        self.test_dataset = self.val_dataset
+        self.predict_dataset = GediSentinelDataset(all_pairs, **common)
+        self.normalization_mean = mean
+        self.normalization_std = std
+        self._is_ready = True
 
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,            
+        print(
+            f"Data: {len(all_pairs)} paired patches, {len(labeled_pairs)} labeled; "
+            f"train={len(train_pairs)} ({sum(p.valid_pixels for p in train_pairs)} GEDI pixels), "
+            f"val={len(val_pairs)} ({sum(p.valid_pixels for p in val_pairs)} GEDI pixels)."
         )
 
-    def val_dataloader(self):
+    def _loader(self, dataset: Dataset, shuffle: bool = False) -> DataLoader:
         return DataLoader(
-            self.val_dataset,
+            dataset,
             batch_size=self.batch_size,
-            shuffle=False,
+            shuffle=shuffle,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=self.num_workers > 0,
         )
 
-    def test_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=False
-        )
+    def train_dataloader(self) -> DataLoader:
+        return self._loader(self.train_dataset, shuffle=True)
 
-    def predict_dataloader(self):
-        return DataLoader(
-            self.predict_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=False
-        )
+    def val_dataloader(self) -> DataLoader:
+        return self._loader(self.val_dataset)
+
+    def test_dataloader(self) -> DataLoader:
+        return self._loader(self.test_dataset)
+
+    def predict_dataloader(self) -> DataLoader:
+        return self._loader(self.predict_dataset)

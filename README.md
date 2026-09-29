@@ -14,9 +14,46 @@
 
 **In this paper, we propose transferring the representations learned by recent depth estimation foundation models to the remote sensing domain for measuring canopy height.** Our findings suggest that our proposed Depth Any Canopy, the result of fine-tuning the Depth Anything v2 model for canopy height estimation, provides a performant and efficient solution, surpassing the current state-of-the-art with superior or comparable performance using only a fraction of the computational resources and parameters. Furthermore, our approach requires less than \$1.30 in compute and results in an estimated carbon footprint of 0.14 kgCO2.
 
+### Ngoc Hien Sentinel--GEDI smoke test
+
+The active pipeline expects data outside this repository with matching file names:
+
+```text
+data/CarbonStock/
+|-- Sentinel/NgocHien/<patch>.npy  # float32 [14, H, W]
+`-- GEDI/NgocHien/<patch>.npy      # float32 [H, W], NaN where unlabeled
+```
+
+From `code/CarbonStock`, install the dependencies once and run:
+
+```powershell
+python -m pip install -r requirements.txt
+python main.py
+```
+
+The default config is deliberately a one-batch CPU smoke test. It discovers and
+validates matching patches, computes 14-channel normalization statistics from the
+training split, runs one optimization step, and reports validation RMSE in metres
+using only finite GEDI pixels in `(0, 30]`. The tiny convolutional model checks the
+pipeline only; its RMSE is not a model-quality result.
+
+For a full randomly initialized 14-channel Depth Anything run, override only the
+settings that differ from the smoke test:
+
+```powershell
+python main.py model.architecture=depth_anything model.image_size=518 trainer.accelerator=auto trainer.max_epochs=100 trainer.limit_train_batches=1.0 trainer.limit_val_batches=1.0 trainer.enable_checkpointing=true
+```
+
+To initialize from a local checkpoint, also set
+`model.pretrained=true model.checkpoint_path=C:/path/to/model.safetensors`.
+Only tensors with matching names and shapes are loaded, so a checkpoint trained
+with fewer input channels will leave the 14-channel patch embedding initialized
+from scratch.
+
 ### Getting Started
 
-Install the dependencies of the *requirements.txt* file. Make sure to edit the config files in the `configs/` folder. Then simply run *main.py*
+All runtime settings now live in `configs/default.yaml`; command-line Hydra
+overrides avoid editing the file for one-off runs.
 
 ### Pre-Trained Models
 

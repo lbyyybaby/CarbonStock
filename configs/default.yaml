@@ -1,7 +1,44 @@
-defaults:
-  - _self_
-  - dataset: earthview
-  - model: depthany_small
-  - trainer: default
+seed: 42
 
-logger: "comet"
+dataset:
+  # Resolved relative to this repository, even if Hydra changes the run directory.
+  data_root: ../../data/CarbonStock
+  regions: NgocHien
+  expected_channels: 14
+  batch_size: 1
+  num_workers: 0
+  train_fraction: 0.8
+  split_seed: 42
+  min_height: 0.0
+  max_height: 30.0
+
+model:
+  # "tiny" verifies data -> forward -> validation offline. Use "depth_anything"
+  # for a real training run and provide the relevant pretrained settings.
+  architecture: tiny
+  encoder: vits
+  in_channels: ${dataset.expected_channels}
+  image_size: 64
+  max_height: ${dataset.max_height}
+  lr: 0.001
+  pretrained: false
+  use_huggingface: false
+  checkpoint_path: null
+
+trainer:
+  accelerator: cpu
+  devices: 1
+  max_epochs: 1
+  limit_train_batches: 1
+  limit_val_batches: 1
+  num_sanity_val_steps: 0
+  enable_checkpointing: false
+  enable_model_summary: false
+  enable_progress_bar: false
+  deterministic: true
+
+# Do not create timestamped Hydra output folders for this console-only run.
+hydra:
+  output_subdir: null
+  run:
+    dir: .

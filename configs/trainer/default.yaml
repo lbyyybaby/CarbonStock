@@ -1,3 +1,0 @@
-devices: "auto"
-accelerator: "auto"
-max_epochs: 100
