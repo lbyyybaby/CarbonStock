@@ -19,16 +19,21 @@ GEDI_BAND = 15
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 GEDI_DIR.mkdir(parents=True, exist_ok=True)
 
-if list(INPUT_DIR.glob("*.npy")) or list(GEDI_DIR.glob("*.npy")):
-    raise RuntimeError(
-        "Output folders already contain .npy files. "
-        "Move or remove them before running again."
-    )
+
+def remove_existing_npy(directory: Path) -> int:
+    npy_files = list(directory.glob("*.npy"))
+    for npy_file in npy_files:
+        npy_file.unlink()
+    return len(npy_files)
 
 
 with rasterio.open(TIF_PATH) as src:
     assert src.count == 15, f"Expected 15 bands, found {src.count}"
     assert src.descriptions[14] == "GEDI_rh98"
+
+    removed_count = remove_existing_npy(INPUT_DIR) + remove_existing_npy(GEDI_DIR)
+    if removed_count:
+        print(f"Removed existing .npy files: {removed_count}")
 
     candidate_count = 0
     no_gedi_count = 0

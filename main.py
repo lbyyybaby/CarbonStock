@@ -26,7 +26,7 @@ def main(config: DictConfig) -> None:
     if rmse is None or valid_pixels is None:
         raise RuntimeError("Validation did not produce val_RMSE and val_valid_pixels.")
     print(
-        f"SMOKE TEST PASSED: val_RMSE={float(rmse):.4f} m, "
+        f"TRAINING FINISHED: val_RMSE={float(rmse):.4f} m, "
         f"valid_GEDI_pixels={int(valid_pixels)}"
     )
 

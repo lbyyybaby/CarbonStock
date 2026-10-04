@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 import lightning as L
 import torch
@@ -69,9 +69,11 @@ class DepthAnythingV2Module(L.LightningModule):
         architecture: Literal["tiny", "depth_anything"] = "tiny",
         encoder: Literal["vits", "vitb", "vitl", "vitg"] = "vits",
         in_channels: int = 14,
-        # image_size: int = 64,
-        # max_height: float = 30.0,
-        # lr: float = 1e-3,
+        image_size: int = 252,
+        max_height: float = 30.0,
+        lr: float = 5e-6,
+        lr_milestones: Sequence[int] = (10, 20, 50),
+        lr_gamma: float = 0.5,
         pretrained: bool = False,
         use_huggingface: bool = False,
         checkpoint_path: str | None = None,
@@ -135,8 +137,22 @@ class DepthAnythingV2Module(L.LightningModule):
         self.model.load_state_dict(compatible, strict=False)
         print(f"Loaded {len(compatible)}/{len(current)} compatible checkpoint tensors.")
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+    def configure_optimizers(self) -> dict[str, object]:
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+        )
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=list(self.hparams.lr_milestones),
+            gamma=self.hparams.lr_gamma,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
     def _predict(self, image: torch.Tensor, output_size: tuple[int, int]) -> torch.Tensor:
         image = F.interpolate(

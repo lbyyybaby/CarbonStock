@@ -24,24 +24,32 @@ data/CarbonStock/
 `-- GEDI/NgocHien/<patch>.npy      # float32 [H, W], NaN where unlabeled
 ```
 
-From `code/CarbonStock`, install the dependencies once and run:
+From `code/CarbonStock`, install the dependencies with a CUDA-enabled PyTorch
+build compatible with the target machine, verify CUDA, and run:
 
 ```powershell
 python -m pip install -r requirements.txt
+python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
 python main.py
 ```
 
-The default config is deliberately a one-batch CPU smoke test. It discovers and
-validates matching patches, computes 14-channel normalization statistics from the
-training split, runs one optimization step, and reports validation RMSE in metres
-using only finite GEDI pixels in `(0, 30]`. The tiny convolutional model checks the
-pipeline only; its RMSE is not a model-quality result.
+The default config runs the 14-channel Depth Anything ViT-S model for 100 epochs
+on one GPU. It discovers and validates matching patches, computes normalization
+statistics from the training split, uses every train/validation batch, saves a
+checkpoint, and reports validation RMSE in metres using only finite GEDI pixels
+in `(0, 30]`.
 
-For a full randomly initialized 14-channel Depth Anything run, override only the
-settings that differ from the smoke test:
+The learning rate starts at `5e-6`, matching the previous Depth Anything code,
+and is halved after epochs 10, 20, and 50 using the decay schedule described in
+GSen-Net. The batch size is 8. The runtime input size is 252, which is divisible
+by the model's 14-pixel patch size.
+
+The model is randomly initialized by default because the available Depth Any
+Canopy checkpoint was trained for RGB input, while this pipeline uses 14 bands.
+For a quick one-batch pipeline check, run:
 
 ```powershell
-python main.py model.architecture=depth_anything model.image_size=518 trainer.accelerator=auto trainer.max_epochs=100 trainer.limit_train_batches=1.0 trainer.limit_val_batches=1.0 trainer.enable_checkpointing=true
+python main.py model.architecture=tiny trainer.max_epochs=1 trainer.limit_train_batches=1 trainer.limit_val_batches=1 trainer.enable_checkpointing=false
 ```
 
 To initialize from a local checkpoint, also set

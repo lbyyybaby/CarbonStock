@@ -405,7 +405,7 @@ def DINOv2(model_name, in_chans=14):
     
     return model_zoo[model_name](
         in_chans=in_chans,
-        img_size=518,
+        img_size=252,
         patch_size=14,
         init_values=1.0,
         ffn_layer="mlp" if model_name != "vitg" else "swiglufused",
