@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal
 
 import lightning as L
 import torch
@@ -72,8 +72,6 @@ class DepthAnythingV2Module(L.LightningModule):
         image_size: int = 252,
         max_height: float = 30.0,
         lr: float = 5e-6,
-        lr_milestones: Sequence[int] = (10, 20, 50),
-        lr_gamma: float = 0.5,
         pretrained: bool = False,
         use_huggingface: bool = False,
         checkpoint_path: str | None = None,
@@ -89,10 +87,15 @@ class DepthAnythingV2Module(L.LightningModule):
                 raise ValueError(f"No Hugging Face model is configured for {encoder}.")
             import transformers
 
+            hf_config = transformers.AutoConfig.from_pretrained(
+                self.size_map[encoder], cache_dir="cache"
+            )
+            pretrained_channels = hf_config.backbone_config.num_channels
+            hf_config.backbone_config.num_channels = in_channels
             self.model = transformers.AutoModelForDepthEstimation.from_pretrained(
                 self.size_map[encoder],
-                num_channels=in_channels,
-                ignore_mismatched_sizes=in_channels != 3,
+                config=hf_config,
+                ignore_mismatched_sizes=in_channels != pretrained_channels,
                 cache_dir="cache",
             )
         else:
@@ -144,17 +147,26 @@ class DepthAnythingV2Module(L.LightningModule):
             betas=(0.9, 0.999),
             weight_decay=0.01,
         )
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            milestones=list(self.hparams.lr_milestones),
-            gamma=self.hparams.lr_gamma,
+            total_steps=self.trainer.estimated_stepping_batches,
+            max_lr=self.hparams.lr,
+            pct_start=0.05,
+            cycle_momentum=False,
+            div_factor=1e9,
+            final_div_factor=1e4,
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
 
-    def _predict(self, image: torch.Tensor, output_size: tuple[int, int]) -> torch.Tensor:
+    def _predict(
+        self,
+        image: torch.Tensor,
+        output_size: tuple[int, int],
+        clamp: bool = True,
+    ) -> torch.Tensor:
         image = F.interpolate(
             image,
             size=(self.hparams.image_size, self.hparams.image_size),
@@ -169,13 +181,18 @@ class DepthAnythingV2Module(L.LightningModule):
             mode="bilinear",
             align_corners=False,
         ).squeeze(1)
-        return prediction.clamp(0.0, self.hparams.max_height)
+        if clamp:
+            prediction = prediction.clamp(0.0, self.hparams.max_height)
+        return prediction
 
     def _shared_step(
         self, batch: dict[str, torch.Tensor], stage: Literal["train", "val", "test"]
     ) -> torch.Tensor:
         target = batch["mask"]
-        prediction = self._predict(batch["image"], tuple(target.shape[-2:]))
+        raw_prediction = self._predict(
+            batch["image"], tuple(target.shape[-2:]), clamp=False
+        )
+        prediction = raw_prediction.clamp(0.0, self.hparams.max_height)
         valid = batch["valid_mask"] & torch.isfinite(target) & torch.isfinite(prediction)
         valid_count = int(valid.sum().item())
         if valid_count == 0:
@@ -194,9 +211,36 @@ class DepthAnythingV2Module(L.LightningModule):
             mse,
             on_step=stage == "train",
             on_epoch=True,
-            prog_bar=False,
+            prog_bar=stage == "train",
             batch_size=valid_count,
         )
+        if stage == "train":
+            valid_raw_prediction = raw_prediction[valid].detach().float()
+            diagnostics = {
+                "train_raw_pred_mean_m": valid_raw_prediction.mean(),
+                "train_below_0_pct": (valid_raw_prediction < 0).float().mean() * 100,
+                "train_above_max_pct": (
+                    (valid_raw_prediction > self.hparams.max_height).float().mean()
+                    * 100
+                ),
+            }
+            for name, value in diagnostics.items():
+                self.log(
+                    name,
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                    batch_size=valid_count,
+                )
+            self.log(
+                "lr",
+                self.trainer.optimizers[0].param_groups[0]["lr"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                batch_size=valid_count,
+            )
         self.log(
             f"{stage}_RMSE",
             rmse_metric,

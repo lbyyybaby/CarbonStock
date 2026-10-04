@@ -39,21 +39,26 @@ statistics from the training split, uses every train/validation batch, saves a
 checkpoint, and reports validation RMSE in metres using only finite GEDI pixels
 in `(0, 30]`.
 
-The learning rate starts at `5e-6`, matching the previous Depth Anything code,
-and is halved after epochs 10, 20, and 50 using the decay schedule described in
-GSen-Net. The batch size is 8. The runtime input size is 252, which is divisible
-by the model's 14-pixel patch size.
+The optimizer and learning-rate schedule match the previous `tqk` training code:
+AdamW with a `5e-6` maximum learning rate and OneCycleLR stepped after every
+optimization step. The batch size is 4. The runtime input size is 252, which is
+divisible by the model's 14-pixel patch size.
 
-The model is randomly initialized by default because the available Depth Any
-Canopy checkpoint was trained for RGB input, while this pipeline uses 14 bands.
+By default, compatible weights are loaded from the RGB Depth Any Canopy ViT-S
+checkpoint. Its input projection is reinitialized for 14 bands, while training
+targets, predictions, loss, and RMSE remain in metres without height scaling.
+The training progress bar reports the current learning rate, loss, RMSE, raw
+prediction mean in metres, and the percentage of raw predictions outside the
+configured height range before clamping.
+
 For a quick one-batch pipeline check, run:
 
 ```powershell
 python main.py model.architecture=tiny trainer.max_epochs=1 trainer.limit_train_batches=1 trainer.limit_val_batches=1 trainer.enable_checkpointing=false
 ```
 
-To initialize from a local checkpoint, also set
-`model.pretrained=true model.checkpoint_path=C:/path/to/model.safetensors`.
+To initialize from a local checkpoint, set
+`model.use_huggingface=false model.pretrained=true model.checkpoint_path=C:/path/to/model.safetensors`.
 Only tensors with matching names and shapes are loaded, so a checkpoint trained
 with fewer input channels will leave the 14-channel patch embedding initialized
 from scratch.
