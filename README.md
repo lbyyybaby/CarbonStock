@@ -44,12 +44,31 @@ AdamW with a `5e-6` maximum learning rate and OneCycleLR stepped after every
 optimization step. The batch size is 4. The runtime input size is 252, which is
 divisible by the model's 14-pixel patch size.
 
-By default, compatible weights are loaded from the RGB Depth Any Canopy ViT-S
-checkpoint. Its input projection is reinitialized for 14 bands, while training
-targets, predictions, loss, and RMSE remain in metres without height scaling.
-The training progress bar reports the current learning rate, loss, RMSE, raw
-prediction mean in metres, and the percentage of raw predictions outside the
-configured height range before clamping.
+By default, compatible weights are loaded only from the local RGB Depth Any
+Canopy ViT-S snapshot at `offline_models/depth-any-canopy-small`; Hugging Face
+network access is disabled. Its input projection is reinitialized for 14 bands.
+GEDI remains in metres in the dataset so filtering stays in `(0, 30]`, while the
+training target is divided by 30 to match the pretrained normalized output.
+Loss is normalized MSE; RMSE and predictions are converted back to metres.
+
+To transfer the model to an offline server, copy and extract the prepared model
+archive so that `offline_models/depth-any-canopy-small/config.json` and
+`model.safetensors` exist. The prepared archive is
+`offline_models/depth-any-canopy-small-5da90568.tar.gz` (revision
+`5da905680afb5943a72966cfcc33a3e6d79e3c49`). On the server:
+
+```bash
+cd /path/to/CarbonStock/offline_models
+sha256sum -c depth-any-canopy-small-5da90568.tar.gz.sha256
+tar -xzf depth-any-canopy-small-5da90568.tar.gz
+```
+
+You can then verify strict offline loading with:
+
+```bash
+cd /path/to/CarbonStock
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python main.py
+```
 
 For a quick one-batch pipeline check, run:
 

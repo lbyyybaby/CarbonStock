@@ -5,5 +5,5 @@ opencv-python>=4.8
 safetensors>=0.4
 torch>=2.4,<3
 torchvision>=0.19,<1
-transformers>=4.44,<5
+transformers==4.44.0
 rasterio==1.4.4

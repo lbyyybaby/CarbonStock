@@ -74,11 +74,16 @@ class DepthAnythingV2Module(L.LightningModule):
         lr: float = 5e-6,
         pretrained: bool = False,
         use_huggingface: bool = False,
+        hf_model_path: str | None = None,
+        hf_local_files_only: bool = True,
         checkpoint_path: str | None = None,
         **_: object,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        if max_height <= 0:
+            raise ValueError("model.max_height must be positive.")
+        self._uses_huggingface = architecture != "tiny" and use_huggingface
 
         if architecture == "tiny":
             self.model = TinyCanopyRegressor(in_channels)
@@ -87,17 +92,50 @@ class DepthAnythingV2Module(L.LightningModule):
                 raise ValueError(f"No Hugging Face model is configured for {encoder}.")
             import transformers
 
+            model_source = hf_model_path or self.size_map[encoder]
+            if hf_local_files_only:
+                local_model_path = Path(model_source).expanduser()
+                if not local_model_path.is_dir():
+                    raise FileNotFoundError(
+                        f"Offline Hugging Face model directory not found: {local_model_path}"
+                    )
+                model_source = str(local_model_path.resolve())
             hf_config = transformers.AutoConfig.from_pretrained(
-                self.size_map[encoder], cache_dir="cache"
+                model_source,
+                local_files_only=hf_local_files_only,
             )
             pretrained_channels = hf_config.backbone_config.num_channels
             hf_config.backbone_config.num_channels = in_channels
-            self.model = transformers.AutoModelForDepthEstimation.from_pretrained(
-                self.size_map[encoder],
-                config=hf_config,
-                ignore_mismatched_sizes=in_channels != pretrained_channels,
-                cache_dir="cache",
-            )
+            if pretrained:
+                self.model, loading_info = (
+                    transformers.AutoModelForDepthEstimation.from_pretrained(
+                        model_source,
+                        config=hf_config,
+                        ignore_mismatched_sizes=in_channels != pretrained_channels,
+                        local_files_only=hf_local_files_only,
+                        output_loading_info=True,
+                    )
+                )
+                expected_mismatches = (
+                    {"backbone.embeddings.patch_embeddings.projection.weight"}
+                    if in_channels != pretrained_channels
+                    else set()
+                )
+                actual_mismatches = {
+                    item[0] for item in loading_info["mismatched_keys"]
+                }
+                if (
+                    loading_info["missing_keys"]
+                    or loading_info["unexpected_keys"]
+                    or loading_info["error_msgs"]
+                    or actual_mismatches != expected_mismatches
+                ):
+                    raise RuntimeError(
+                        "Unexpected Hugging Face checkpoint loading result: "
+                        f"{loading_info}"
+                    )
+            else:
+                self.model = transformers.AutoModelForDepthEstimation.from_config(hf_config)
         else:
             from model import DepthAnythingV2
 
@@ -137,6 +175,11 @@ class DepthAnythingV2Module(L.LightningModule):
             if key.removeprefix("model.") in current
             and current[key.removeprefix("model.")].shape == value.shape
         }
+        if not compatible:
+            raise RuntimeError(
+                "Checkpoint has no tensors compatible with the native model. "
+                "Use model.use_huggingface=true for a Hugging Face checkpoint."
+            )
         self.model.load_state_dict(compatible, strict=False)
         print(f"Loaded {len(compatible)}/{len(current)} compatible checkpoint tensors.")
 
@@ -174,7 +217,7 @@ class DepthAnythingV2Module(L.LightningModule):
             align_corners=False,
         )
         output = self.model(image)
-        prediction = output.predicted_depth if self.hparams.use_huggingface else output
+        prediction = output.predicted_depth if self._uses_huggingface else output
         prediction = F.interpolate(
             prediction.unsqueeze(1),
             size=output_size,
@@ -182,28 +225,36 @@ class DepthAnythingV2Module(L.LightningModule):
             align_corners=False,
         ).squeeze(1)
         if clamp:
-            prediction = prediction.clamp(0.0, self.hparams.max_height)
+            prediction = prediction.clamp(0.0, 1.0)
         return prediction
 
     def _shared_step(
         self, batch: dict[str, torch.Tensor], stage: Literal["train", "val", "test"]
     ) -> torch.Tensor:
-        target = batch["mask"]
-        raw_prediction = self._predict(
-            batch["image"], tuple(target.shape[-2:]), clamp=False
+        target_m = batch["mask"]
+        target_normalized = target_m / self.hparams.max_height
+        raw_prediction_normalized = self._predict(
+            batch["image"], tuple(target_m.shape[-2:]), clamp=False
         )
-        prediction = raw_prediction.clamp(0.0, self.hparams.max_height)
-        valid = batch["valid_mask"] & torch.isfinite(target) & torch.isfinite(prediction)
+        valid = (
+            batch["valid_mask"]
+            & torch.isfinite(target_m)
+            & torch.isfinite(raw_prediction_normalized)
+        )
         valid_count = int(valid.sum().item())
         if valid_count == 0:
             raise RuntimeError(f"Batch has no valid GEDI pixels during {stage}.")
 
-        valid_prediction = prediction[valid]
-        valid_target = target[valid]
-        mse = F.mse_loss(valid_prediction, valid_target)
+        valid_raw_prediction = raw_prediction_normalized[valid]
+        valid_target_normalized = target_normalized[valid]
+        mse = F.mse_loss(valid_raw_prediction, valid_target_normalized)
+        prediction_m = (
+            raw_prediction_normalized.detach().clamp(0.0, 1.0)
+            * self.hparams.max_height
+        )
         rmse_metric: ValidPixelRMSE = getattr(self, f"{stage}_rmse")
         pixel_metric: SumMetric = getattr(self, f"{stage}_pixels")
-        rmse_metric.update(valid_prediction, valid_target)
+        rmse_metric.update(prediction_m[valid], target_m[valid])
         pixel_metric.update(torch.tensor(valid_count, device=self.device))
 
         self.log(
@@ -215,14 +266,11 @@ class DepthAnythingV2Module(L.LightningModule):
             batch_size=valid_count,
         )
         if stage == "train":
-            valid_raw_prediction = raw_prediction[valid].detach().float()
+            valid_raw_prediction = valid_raw_prediction.detach().float()
             diagnostics = {
-                "train_raw_pred_mean_m": valid_raw_prediction.mean(),
+                "train_raw_pred_mean_normalized": valid_raw_prediction.mean(),
                 "train_below_0_pct": (valid_raw_prediction < 0).float().mean() * 100,
-                "train_above_max_pct": (
-                    (valid_raw_prediction > self.hparams.max_height).float().mean()
-                    * 100
-                ),
+                "train_above_1_pct": (valid_raw_prediction > 1).float().mean() * 100,
             }
             for name, value in diagnostics.items():
                 self.log(
@@ -277,6 +325,9 @@ class DepthAnythingV2Module(L.LightningModule):
         target = batch["mask"]
         return {
             "patch_id": batch["patch_id"],
-            "prediction_m": self._predict(batch["image"], tuple(target.shape[-2:])),
+            "prediction_m": self._predict(
+                batch["image"], tuple(target.shape[-2:])
+            )
+            * self.hparams.max_height,
             "valid_mask": batch["valid_mask"],
         }

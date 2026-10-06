@@ -21,11 +21,13 @@ model:
   lr: 5.0e-6
   pretrained: true
   use_huggingface: true
+  hf_model_path: offline_models/depth-any-canopy-small
+  hf_local_files_only: true
   checkpoint_path: null
 
 trainer:
-  accelerator: auto
-  devices: auto
+  accelerator: gpu
+  devices: 1
   max_epochs: 100
   limit_train_batches: 1.0
   limit_val_batches: 1.0

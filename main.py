@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import hydra
 import lightning as L
 import torch
 from dataset import GediSentinelDataModule
-from hydra.utils import to_absolute_path
 from lightning_model import DepthAnythingV2Module
 from omegaconf import DictConfig, OmegaConf
 
@@ -14,10 +15,22 @@ def main(config: DictConfig) -> None:
     L.seed_everything(config.seed, workers=True)
     torch.set_float32_matmul_precision("medium")
 
+    repository_root = Path(__file__).resolve().parent
+
+    def resolve_repository_path(value: str) -> str:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = repository_root / path
+        return str(path.resolve())
+
     dataset_config = OmegaConf.to_container(config.dataset, resolve=True)
-    dataset_config["data_root"] = to_absolute_path(dataset_config["data_root"])
+    dataset_config["data_root"] = resolve_repository_path(dataset_config["data_root"])
+    model_config = OmegaConf.to_container(config.model, resolve=True)
+    for path_key in ("hf_model_path", "checkpoint_path"):
+        if model_config.get(path_key):
+            model_config[path_key] = resolve_repository_path(model_config[path_key])
     data_module = GediSentinelDataModule(**dataset_config)
-    model = DepthAnythingV2Module(**config.model)
+    model = DepthAnythingV2Module(**model_config)
     trainer = L.Trainer(**config.trainer, logger=False)
 
     trainer.fit(model, datamodule=data_module)
