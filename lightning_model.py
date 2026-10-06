@@ -121,8 +121,20 @@ class DepthAnythingV2Module(L.LightningModule):
                     if in_channels != pretrained_channels
                     else set()
                 )
+                # Transformers versions expose mismatched keys either as plain
+                # strings or as tuples/dicts containing the parameter name.
+                def mismatch_name(item: object) -> str | None:
+                    if isinstance(item, str):
+                        return item
+                    if isinstance(item, dict):
+                        value = item.get("key") or item.get("name")
+                        return value if isinstance(value, str) else None
+                    if isinstance(item, (tuple, list)) and item:
+                        return item[0] if isinstance(item[0], str) else None
+                    return None
+
                 actual_mismatches = {
-                    item[0] for item in loading_info["mismatched_keys"]
+                    mismatch_name(item) for item in loading_info["mismatched_keys"]
                 }
                 if (
                     loading_info["missing_keys"]
