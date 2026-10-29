@@ -1,23 +1,25 @@
 seed: 42
+output_dir: runs/agbd
+run_test: false
 
 dataset:
   # Resolved relative to this repository, even if Hydra changes the run directory.
-  data_root: ../../data/CarbonStock
-  regions: NgocHien
+  data_root: ../../data/CarbonStock/processed
+  regions: null
   expected_channels: 14
   batch_size: 4
   num_workers: 4
-  train_fraction: 0.8
-  split_seed: 42
-  min_height: 0.0
-  max_height: 30.0
+  train_fraction: 0.6
+  val_fraction: 0.2
+  buffer_m: 1000.0
+  split_crs: EPSG:32648
+  target_scale_quantile: 0.95
 
 model:
   architecture: depth_anything
   encoder: vits
   in_channels: ${dataset.expected_channels}
   image_size: 252
-  max_height: ${dataset.max_height}
   lr: 5.0e-6
   pretrained: true
   use_huggingface: true
