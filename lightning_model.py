@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -70,7 +71,8 @@ class DepthAnythingV2Module(L.LightningModule):
         encoder: Literal["vits", "vitb", "vitl", "vitg"] = "vits",
         in_channels: int = 14,
         image_size: int = 252,
-        max_height: float = 30.0,
+        target_scale: float = 1.0,
+        train_target_mean: float = 0.0,
         lr: float = 5e-6,
         pretrained: bool = False,
         use_huggingface: bool = False,
@@ -81,8 +83,8 @@ class DepthAnythingV2Module(L.LightningModule):
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
-        if max_height <= 0:
-            raise ValueError("model.max_height must be positive.")
+        if not math.isfinite(target_scale) or target_scale <= 0:
+            raise ValueError("model.target_scale must be finite and positive.")
         self._uses_huggingface = architecture != "tiny" and use_huggingface
 
         if architecture == "tiny":
@@ -165,6 +167,8 @@ class DepthAnythingV2Module(L.LightningModule):
         self.train_rmse = ValidPixelRMSE()
         self.val_rmse = ValidPixelRMSE()
         self.test_rmse = ValidPixelRMSE()
+        self.val_mean_baseline_rmse = ValidPixelRMSE()
+        self.test_mean_baseline_rmse = ValidPixelRMSE()
         self.train_pixels = SumMetric()
         self.val_pixels = SumMetric()
         self.test_pixels = SumMetric()
@@ -220,54 +224,66 @@ class DepthAnythingV2Module(L.LightningModule):
         self,
         image: torch.Tensor,
         output_size: tuple[int, int],
-        clamp: bool = True,
     ) -> torch.Tensor:
-        image = F.interpolate(
-            image,
-            size=(self.hparams.image_size, self.hparams.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        model_input_size = (self.hparams.image_size, self.hparams.image_size)
+        if image.shape[-2:] != model_input_size:
+            image = F.interpolate(
+                image,
+                size=model_input_size,
+                mode="bilinear",
+                align_corners=False,
+            )
         output = self.model(image)
         prediction = output.predicted_depth if self._uses_huggingface else output
-        prediction = F.interpolate(
-            prediction.unsqueeze(1),
-            size=output_size,
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(1)
-        if clamp:
-            prediction = prediction.clamp(0.0, 1.0)
+        if prediction.shape[-2:] != output_size:
+            prediction = F.interpolate(
+                prediction.unsqueeze(1),
+                size=output_size,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
         return prediction
 
     def _shared_step(
         self, batch: dict[str, torch.Tensor], stage: Literal["train", "val", "test"]
-    ) -> torch.Tensor:
-        target_m = batch["mask"]
-        target_normalized = target_m / self.hparams.max_height
+    ) -> torch.Tensor | None:
+        target_agbd = batch["mask"]
+        target_normalized = target_agbd / self.hparams.target_scale
         raw_prediction_normalized = self._predict(
-            batch["image"], tuple(target_m.shape[-2:]), clamp=False
+            batch["image"], tuple(target_agbd.shape[-2:])
         )
         valid = (
             batch["valid_mask"]
-            & torch.isfinite(target_m)
-            & torch.isfinite(raw_prediction_normalized)
+            & torch.isfinite(target_agbd)
+            & (target_agbd >= 0)
         )
         valid_count = int(valid.sum().item())
         if valid_count == 0:
-            raise RuntimeError(f"Batch has no valid GEDI pixels during {stage}.")
+            # Unlabeled map patches can pass through prediction or a mixed loader.
+            return None
+        if not torch.isfinite(raw_prediction_normalized[valid]).all():
+            raise FloatingPointError(f"Non-finite AGBD prediction during {stage}.")
 
         valid_raw_prediction = raw_prediction_normalized[valid]
         valid_target_normalized = target_normalized[valid]
         mse = F.mse_loss(valid_raw_prediction, valid_target_normalized)
-        prediction_m = (
-            raw_prediction_normalized.detach().clamp(0.0, 1.0)
-            * self.hparams.max_height
+        prediction_agbd = (
+            raw_prediction_normalized.detach() * self.hparams.target_scale
         )
         rmse_metric: ValidPixelRMSE = getattr(self, f"{stage}_rmse")
         pixel_metric: SumMetric = getattr(self, f"{stage}_pixels")
-        rmse_metric.update(prediction_m[valid], target_m[valid])
+        rmse_metric.update(prediction_agbd[valid], target_agbd[valid])
         pixel_metric.update(torch.tensor(valid_count, device=self.device))
+        if stage != "train":
+            baseline_metric = getattr(self, f"{stage}_mean_baseline_rmse")
+            baseline_metric.update(
+                torch.full_like(target_agbd[valid], self.hparams.train_target_mean),
+                target_agbd[valid],
+            )
+            self.log(
+                f"{stage}_mean_baseline_RMSE", baseline_metric,
+                on_step=False, on_epoch=True,
+            )
 
         self.log(
             f"{stage}_Loss(MSE)",
@@ -282,7 +298,6 @@ class DepthAnythingV2Module(L.LightningModule):
             diagnostics = {
                 "train_raw_pred_mean_normalized": valid_raw_prediction.mean(),
                 "train_below_0_pct": (valid_raw_prediction < 0).float().mean() * 100,
-                "train_above_1_pct": (valid_raw_prediction > 1).float().mean() * 100,
             }
             for name, value in diagnostics.items():
                 self.log(
@@ -316,7 +331,7 @@ class DepthAnythingV2Module(L.LightningModule):
         )
         return mse
 
-    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor | None:
         return self._shared_step(batch, "train")
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -327,7 +342,7 @@ class DepthAnythingV2Module(L.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         self.print(
-            f"Validation: RMSE={self.val_rmse.compute().item():.4f} m on "
+            f"Validation: RMSE={self.val_rmse.compute().item():.4f} Mg/ha on "
             f"{int(self.val_pixels.compute().item())} valid GEDI pixels"
         )
 
@@ -337,9 +352,9 @@ class DepthAnythingV2Module(L.LightningModule):
         target = batch["mask"]
         return {
             "patch_id": batch["patch_id"],
-            "prediction_m": self._predict(
+            "prediction_agbd": self._predict(
                 batch["image"], tuple(target.shape[-2:])
             )
-            * self.hparams.max_height,
+            * self.hparams.target_scale,
             "valid_mask": batch["valid_mask"],
         }
