@@ -14,42 +14,79 @@
 
 **In this paper, we propose transferring the representations learned by recent depth estimation foundation models to the remote sensing domain for measuring canopy height.** Our findings suggest that our proposed Depth Any Canopy, the result of fine-tuning the Depth Anything v2 model for canopy height estimation, provides a performant and efficient solution, surpassing the current state-of-the-art with superior or comparable performance using only a fraction of the computational resources and parameters. Furthermore, our approach requires less than \$1.30 in compute and results in an estimated carbon footprint of 0.14 kgCO2.
 
-### Sentinel-GEDI smoke test
+### Sentinel-GEDI L4A biomass training
 
-The active pipeline expects data outside this repository with matching file names:
+The configured model remains the pretrained 14-channel Depth Anything ViT-S.
+The baseline uses this same model to learn AGBD, without adding another model.
+The active pipeline reads the existing processed layout:
 
 ```text
-data/CarbonStock/
-|-- Sentinel/NgocHien/<patch>.npy  # float32 [14, H, W]
-`-- GEDI/NgocHien/<patch>.npy      # float32 [H, W], NaN where unlabeled
+data/CarbonStock/processed/<province>/<site>/<period>/
+|-- input/<patch>.npy             # float32 [14, H, W]
+|-- gedi/<patch>.npy              # AGBD [H, W], Mg/ha; NaN = unlabeled
+|-- input_valid_mask/<patch>.npy  # boolean [H, W]
+|-- metadata/<patch>.json         # CRS, footprint, AGBD and quality provenance
+`-- manifest.json
 ```
 
-From `code/CarbonStock`, install the dependencies with a CUDA-enabled PyTorch
-build compatible with the target machine, verify CUDA, and run:
+Existing local AGBD was confirmed by the user to have been quality filtered;
+that confirmation is recorded in its JSON metadata, without regenerating NPYs.
+For future conversion, the TIFF must explicitly contain `GEDI_AGBD`. The
+converter checks L4A `algorithm_run_flag=1`, `l4_quality_flag=1`, `degrade_flag=0`
+when flag bands are supplied. For an export already filtered before temporal
+aggregation, pass `--quality-filtered-provenance "<export filtering description>"`.
+RH98 is rejected. The L4A band definitions and units are documented in the
+[Earth Engine catalog](https://developers.google.com/earth-engine/datasets/catalog/LARSE_GEDI_GEDI04_A_002_MONTHLY).
+
+Train/validation/test occupy separate west-to-east geographic strips in
+`dataset.split_crs` (default EPSG:32648, metres), with extent fractions 60/20/20.
+Full patch footprints intersecting the 1 km boundary buffers are excluded from
+fitting and evaluation. Fractions describe geographic width, not patch counts.
+Repeated locations across years cannot cross partitions. An empty labeled
+partition raises an error; validation is never reused as test.
+
+Loss uses only finite, nonnegative AGBD labels with valid Sentinel inputs.
+Zero biomass is valid. All patches, including unlabeled and buffer patches,
+remain in `predict_dataloader()` for later mapping. Input normalization uses
+only the geographic training region. The biomass scale is the 95th percentile
+of valid training labels (minimum scale 1 Mg/ha); it neither removes nor clips
+labels or predictions. Loss is normalized MSE, while RMSE and `prediction_agbd`
+are in Mg/ha with no upper output limit. Validation/test also report RMSE for
+a constant predictor equal to mean training AGBD.
+
+From `code/CarbonStock`, a basic local check uses the same configured model
+with a smaller input and one train/validation batch:
 
 ```powershell
-python -m pip install -r requirements.txt
-python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
-python main.py
+python main.py trainer.accelerator=cpu dataset.num_workers=0 dataset.batch_size=1 model.image_size=56 trainer.max_epochs=1 trainer.limit_train_batches=1 trainer.limit_val_batches=1 trainer.enable_checkpointing=false output_dir=runs/agbd-smoke
 ```
 
-The default config runs the 14-channel Depth Anything ViT-S model for 100 epochs
-on one GPU. It discovers and validates matching patches, computes normalization
-statistics from the training split, uses every train/validation batch, saves a
-checkpoint, and reports validation RMSE in metres using only finite GEDI pixels
-in `(0, 30]`.
+Local learnability check (2026-10-29): the configured pretrained ViT-S, with all
+parameters trainable, learned one 56x56 training crop containing 20 valid AGBD
+pixels in 30 CPU AdamW steps at the configured learning rate 5e-6. Normalized
+MSE fell from 0.23694 to 0.00310; crop RMSE fell from 50.56 to 5.79 Mg/ha.
+This confirms optimization on a small training subset, not generalization.
+The separate `main.py` one-batch training/validation and checkpoint smoke check
+also passed. The current independent test contains only 2 labeled patches
+(410 valid pixels), so a full test score will have limited geographic support.
 
-The optimizer and learning-rate schedule match the previous `tqk` training code:
-AdamW with a `5e-6` maximum learning rate and OneCycleLR stepped after every
-optimization step. The batch size is 4. The runtime input size is 252, which is
-divisible by the model's 14-pixel patch size.
+For the full server run, install a compatible CUDA-enabled PyTorch build and
+the requirements, copy the processed data **including its JSON metadata**, and
+run:
 
-By default, compatible weights are loaded only from the local RGB Depth Any
-Canopy ViT-S snapshot at `offline_models/depth-any-canopy-small`; Hugging Face
-network access is disabled. Its input projection is reinitialized for 14 bands.
-GEDI remains in metres in the dataset so filtering stays in `(0, 30]`, while the
-training target is divided by 30 to match the pretrained normalized output.
-Loss is normalized MSE; RMSE and predictions are converted back to metres.
+```bash
+python -m pip install -r requirements.txt
+python main.py run_test=true
+```
+
+Default training remains 100 epochs, batch size 4, input size 252, and maximum
+learning rate 5e-6 with AdamW/OneCycleLR. It loads the local RGB Depth Any Canopy
+snapshot at `offline_models/depth-any-canopy-small` with networking disabled;
+the input projection is reinitialized for 14 bands. `runs/agbd/data_summary.json`
+records geographic assignments, buffers and training normalization/scale;
+`metrics.json` records results. The best validation checkpoint is selected
+before independent test evaluation. `run_test=false` (default) leaves test
+evaluation for the server run. Use a distinct `output_dir` for each experiment.
 
 To transfer the model to an offline server, copy and extract the prepared model
 archive so that `offline_models/depth-any-canopy-small/config.json` and
@@ -68,12 +105,6 @@ You can then verify strict offline loading with:
 ```bash
 cd /path/to/CarbonStock
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python main.py
-```
-
-For a quick one-batch pipeline check, run:
-
-```powershell
-python main.py model.architecture=tiny trainer.max_epochs=1 trainer.limit_train_batches=1 trainer.limit_val_batches=1 trainer.enable_checkpointing=false
 ```
 
 To initialize from a local checkpoint, set
