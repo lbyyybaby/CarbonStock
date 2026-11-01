@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import hydra
@@ -9,11 +12,14 @@ import torch
 from dataset import GediSentinelDataModule
 from lightning_model import DepthAnythingV2Module
 from omegaconf import DictConfig, OmegaConf
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 
 
 @hydra.main(config_path="configs", config_name="default", version_base=None)
 def main(config: DictConfig) -> None:
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.perf_counter()
     L.seed_everything(config.seed, workers=True)
     torch.set_float32_matmul_precision("medium")
 
@@ -56,12 +62,21 @@ def main(config: DictConfig) -> None:
         dirpath=output_dir / "checkpoints", monitor="val_RMSE", mode="min",
         save_top_k=1, filename="best-{epoch:03d}",
     ) if config.trainer.enable_checkpointing else None
+    early_stopping = EarlyStopping(
+        monitor="val_RMSE", mode="min", patience=config.early_stopping.patience,
+        min_delta=config.early_stopping.min_delta, check_finite=True,
+        check_on_train_epoch_end=False, verbose=True,
+    ) if config.early_stopping.enabled else None
+    callbacks = [callback for callback in (checkpoint, early_stopping) if callback is not None]
     trainer = L.Trainer(
-        **config.trainer, logger=False,
-        callbacks=[checkpoint] if checkpoint else [],
+        **config.trainer,
+        logger=CSVLogger(save_dir=str(output_dir), name="history", version=""),
+        callbacks=callbacks,
     )
 
+    fit_started = time.perf_counter()
     trainer.fit(model, datamodule=data_module)
+    fit_seconds = time.perf_counter() - fit_started
     rmse = trainer.callback_metrics.get("val_RMSE")
     valid_pixels = trainer.callback_metrics.get("val_valid_pixels")
     if rmse is None or valid_pixels is None:
@@ -71,12 +86,34 @@ def main(config: DictConfig) -> None:
         f"valid_GEDI_pixels={int(valid_pixels)}"
     )
     metrics = {key: float(value) for key, value in trainer.callback_metrics.items()}
+    metrics["training_summary"] = {
+        "epochs_completed": trainer.current_epoch,
+        "optimizer_steps": trainer.global_step,
+        "best_val_RMSE": float(checkpoint.best_model_score) if checkpoint else None,
+        "best_checkpoint": checkpoint.best_model_path if checkpoint else None,
+        "early_stopping_enabled": early_stopping is not None,
+        "stopped_early": bool(early_stopping and early_stopping.stopped_epoch > 0),
+        "early_stopping_patience": config.early_stopping.patience,
+        "early_stopping_min_delta_mg_ha": config.early_stopping.min_delta,
+        "fit_seconds": fit_seconds,
+    }
+    test_started = time.perf_counter()
     if config.run_test:
         # Independent test is evaluated only on request, after model selection.
         metrics["independent_test"] = trainer.test(
             model, datamodule=data_module,
             ckpt_path=checkpoint.best_model_path if checkpoint else None,
         )
+    metrics["runtime"] = {
+        "started_at_utc": started_at,
+        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": time.perf_counter() - started,
+        "test_seconds": time.perf_counter() - test_started if config.run_test else 0.0,
+        "torch_version": torch.__version__,
+        "accelerator": type(trainer.accelerator).__name__,
+        "cpu_threads": torch.get_num_threads(),
+        "logical_cpus": os.cpu_count(),
+    }
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )

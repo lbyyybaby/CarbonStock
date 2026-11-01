@@ -2,6 +2,11 @@ seed: 42
 output_dir: runs/agbd
 run_test: false
 
+early_stopping:
+  enabled: false
+  patience: 5
+  min_delta: 0.1  # Validation RMSE improvement in Mg/ha.
+
 dataset:
   # Resolved relative to this repository, even if Hydra changes the run directory.
   data_root: ../../data/CarbonStock/processed
