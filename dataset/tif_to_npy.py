@@ -1,5 +1,7 @@
 """Export Sentinel/GEDI L4A AGBD TIFFs to NPY patches, retaining unlabeled patches."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import re
@@ -20,39 +22,34 @@ OUTPUT_FOLDERS = ("input", "gedi", "input_valid_mask", "metadata")
 QUALITY_FLAGS = {"algorithm_run_flag": 1, "l4_quality_flag": 1, "degrade_flag": 0}
 
 
-def agbd_metadata(provenance: str, method: str = "upstream_user_confirmed") -> dict:
-    """Describe the label contract in both patch metadata and the manifest.
-
-    Upstream confirmation is an explicit assertion that the GEDI L4A quality
-    policy was applied before any temporal aggregation; it cannot be inferred
-    from AGBD values or from a band name alone.
-    """
-    if not provenance or not provenance.strip():
-        raise ValueError("Quality-filter provenance must be nonempty.")
+def agbd_metadata(provenance: str | None = None, method: str = "not_verified") -> dict:
+    """Record AGBD labels without assuming that missing QA was applied upstream."""
     return {
         "target": "agbd", "target_units": "Mg/ha", "label_product": "GEDI_L4A",
         "quality_filter": {
-            "applied": True, "method": method,
-            "required_flags": dict(QUALITY_FLAGS), "provenance": provenance.strip(),
+            "applied": None if method == "not_verified" else True, "method": method,
+            "required_flags": dict(QUALITY_FLAGS),
+            "provenance": provenance.strip() if provenance else None,
         },
     }
 
 
 def label_band_contract(src, quality_filtered_provenance: str | None) -> tuple[int, dict, dict]:
-    """Require explicit AGBD and either per-pixel QA or confirmed upstream QA."""
-    names = [(name or "").lower().removeprefix("gedi_") for name in src.descriptions]
-    if any("rh98" in name for name in names):
-        raise ValueError("RH98 is canopy height, not AGBD. Export GEDI L4A agbd in Mg/ha.")
-    if src.count < INPUT_BANDS + 1 or names[INPUT_BANDS] != "agbd":
-        raise ValueError("Expected 14 Sentinel bands followed by GEDI_AGBD (Mg/ha).")
-    extras = names[INPUT_BANDS + 1:]
+    """Read 14 Sentinel bands and a named AGBD band; quality bands are optional."""
+    names = [(name or "").strip().lower().removeprefix("gedi_") for name in src.descriptions]
+    targets = [i for i, name in enumerate(names) if i >= INPUT_BANDS and name == "agbd"]
+    if len(targets) != 1:
+        raise ValueError("Expected 14 Sentinel bands and exactly one AGBD or GEDI_AGBD band after them (Mg/ha).")
     supported = {*QUALITY_FLAGS, "predictor_limit_flag", "response_limit_flag"}
-    if len(extras) != len(set(extras)) or set(extras) - supported:
-        raise ValueError(f"Unsupported/duplicate GEDI quality bands: {extras}.")
-    flag_indices = {name: INPUT_BANDS + 1 + extras.index(name) for name in extras}
+    flag_indices = {}
+    for index, name in enumerate(names[INPUT_BANDS:], start=INPUT_BANDS):
+        if name in supported:
+            if name in flag_indices:
+                raise ValueError(f"Duplicate GEDI quality band: {name}.")
+            flag_indices[name] = index
     if all(name in flag_indices for name in QUALITY_FLAGS):
         metadata = agbd_metadata(
-            "Validated per-pixel quality bands in source TIFF: " + ", ".join(extras),
+            "Validated per-pixel quality bands in source TIFF: " + ", ".join(flag_indices),
             method="raw_flags",
         )
         # Optional extrapolation flags are conservative when provided.
@@ -60,25 +57,21 @@ def label_band_contract(src, quality_filtered_provenance: str | None) -> tuple[i
             name: 0 for name in ("predictor_limit_flag", "response_limit_flag")
             if name in flag_indices
         }
-    elif quality_filtered_provenance is not None:
-        metadata = agbd_metadata(quality_filtered_provenance)
+    elif quality_filtered_provenance and quality_filtered_provenance.strip():
+        metadata = agbd_metadata(quality_filtered_provenance, method="upstream_user_confirmed")
     else:
-        raise ValueError(
-            "GEDI L4A quality flags are missing. Include algorithm_run_flag, "
-            "l4_quality_flag, degrade_flag, or explicitly confirm filtering before "
-            "temporal aggregation with --quality-filtered-provenance."
-        )
-    return INPUT_BANDS, flag_indices, metadata
+        metadata = agbd_metadata()
+    return targets[0], flag_indices, metadata
 
 
-def parse_source_ids(tif_path: Path) -> tuple[str, str, str]:
+def parse_source_ids(tif_path: Path) -> tuple[str, str, str, str]:
     match = re.fullmatch(
-        r"([^_]+)_([^_]+)_(\d{4}_\d{4})_S1_S2_GEDI", tif_path.stem
+        r"([^_]+)_([^_]+)_([^_]+)_(\d{4}_\d{4})_S1_S2_GEDI", tif_path.stem
     )
     if match is None:
         raise ValueError(
             f"Invalid filename: {tif_path.name}. Expected "
-            "<province>_<forest>_<YYYY_YYYY>_S1_S2_GEDI.tif"
+            "<country>_<province>_<forest>_<YYYY_YYYY>_S1_S2_GEDI.tif"
         )
     return match.groups()
 
@@ -91,7 +84,7 @@ def write_json(path: Path, metadata: dict) -> None:
 
 
 def prepare_output(directory: Path, overwrite: bool) -> None:
-    # Only inspect this province/site/window; other windows are untouched.
+    # Only inspect this country/province/site/window; other windows are untouched.
     files = [
         path
         for folder in OUTPUT_FOLDERS
@@ -159,8 +152,8 @@ def convert_tif(
     quality_filtered_provenance: str | None = None,
 ) -> dict:
     tif_path = Path(tif_path).expanduser().resolve()
-    province, site, period = parse_source_ids(tif_path)
-    directory = Path(output_root).expanduser().resolve() / province / site / period
+    country, province, site, period = parse_source_ids(tif_path)
+    directory = Path(output_root).expanduser().resolve() / country / province / site / period
     if patch_size <= 0:
         raise ValueError("patch_size must be positive.")
 
@@ -174,7 +167,7 @@ def convert_tif(
         nodata = [str(v) if v is not None and not np.isfinite(v) else v for v in src.nodatavals]
         common = {
             **label_metadata,
-            "province_id": province, "site_id": site, "window_id": period,
+            "country_id": country, "province_id": province, "site_id": site, "window_id": period,
             "source_tif": str(tif_path),
             "crs": {"value": src.crs.to_string(), "epsg": src.crs.to_epsg()},
             "resolution": {
@@ -230,7 +223,7 @@ def convert_tif(
         manifest = {
             **label_metadata,
             **counts,
-            "province_id": province, "site_id": site, "window_id": period,
+            "country_id": country, "province_id": province, "site_id": site, "window_id": period,
             "source_tif": str(tif_path),
             "source_shape": {"bands": src.count, "height": src.height, "width": src.width},
             "patch_size": patch_size,
@@ -251,10 +244,10 @@ def main() -> None:
     parser.add_argument("tif_paths", nargs="*", type=Path)
     parser.add_argument("--output-root", type=Path, default=DATA_ROOT / "processed")
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
-    parser.add_argument("--overwrite", action="store_true", help="Replace generated files in the matching province/site/window.")
+    parser.add_argument("--overwrite", action="store_true", help="Replace generated files in the matching country/province/site/window.")
     parser.add_argument(
         "--quality-filtered-provenance",
-        help="Explicit provenance confirming GEDI L4A quality filtering before temporal aggregation, for TIFFs without QA bands.",
+        help="Optional provenance confirming GEDI L4A quality filtering before temporal aggregation.",
     )
     args = parser.parse_args()
     tif_paths = args.tif_paths or sorted(RAW_DIR.glob("*_S1_S2_GEDI.tif"))

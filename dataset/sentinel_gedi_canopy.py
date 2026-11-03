@@ -46,13 +46,6 @@ def _validated_bounds(metadata: dict, path: Path, split_crs: rasterio.crs.CRS) -
     if (metadata.get("target") != "agbd" or metadata.get("target_units") != "Mg/ha"
             or metadata.get("label_product") != "GEDI_L4A"):
         raise ValueError(f"{path}: require target=agbd, target_units=Mg/ha, label_product=GEDI_L4A.")
-    quality = metadata.get("quality_filter", {})
-    flags = {"algorithm_run_flag": 1, "l4_quality_flag": 1, "degrade_flag": 0}
-    if (not isinstance(quality, dict) or quality.get("applied") is not True
-            or quality.get("required_flags") != flags
-            or not isinstance(quality.get("method"), str) or not quality["method"].strip()
-            or not isinstance(quality.get("provenance"), str) or not quality["provenance"].strip()):
-        raise ValueError(f"{path}: missing verified GEDI L4A quality-filter provenance ({flags}).")
     try:
         crs_value = metadata["crs"]
         crs = rasterio.crs.CRS.from_user_input(crs_value["value"] if isinstance(crs_value, dict) else crs_value)
@@ -71,7 +64,7 @@ def discover_patch_pairs(
     data_root: str | Path, regions: str | Sequence[str] | None = None,
     expected_channels: int = 14, split_crs: str = "EPSG:32648",
 ) -> list[PatchPair]:
-    """Read processed province/site/period patches, including unlabeled patches."""
+    """Read processed patches recursively, including country folders and unlabeled patches."""
     root = Path(data_root).expanduser().resolve()
     metric_crs = rasterio.crs.CRS.from_user_input(split_crs)
     if not metric_crs.is_projected or not np.isclose(metric_crs.linear_units_factor[1], 1.0):

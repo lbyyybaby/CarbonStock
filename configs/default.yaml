@@ -1,9 +1,10 @@
 seed: 42
-output_dir: runs/agbd
+# The Slurm launcher supplies one directory for logs and model outputs.
+output_dir: ${oc.env:CARBONSTOCK_RUN_DIR,runs/agbd/${now:%Y-%m-%d_%H-%M-%S}}
 run_test: false
 
 early_stopping:
-  enabled: false
+  enabled: true
   patience: 5
   min_delta: 0.1  # Validation RMSE improvement in Mg/ha.
 
@@ -44,8 +45,10 @@ trainer:
   enable_progress_bar: true
   deterministic: false
 
-# Do not create timestamped Hydra output folders for this console-only run.
+# Keep Hydra logs and the resolved configuration with the training artifacts.
 hydra:
-  output_subdir: null
+  output_subdir: .hydra
+  job:
+    chdir: false
   run:
-    dir: .
+    dir: ${output_dir}

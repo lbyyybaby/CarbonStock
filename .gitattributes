@@ -1,0 +1,6 @@
+*.sh text eol=lf
+*.slurm text eol=lf
+
+# Preserve raw terminal logs, including progress-bar carriage returns and spaces.
+runs/**/train-*.out -text -whitespace
+runs/**/train-*.err -text -whitespace
