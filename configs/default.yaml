@@ -20,6 +20,7 @@ dataset:
   buffer_m: 1000.0
   split_crs: EPSG:32648
   target_scale_quantile: 0.95
+  max_agbd: 500.0  # Exclude labels >500 Mg/ha; null disables this filter.
 
 model:
   architecture: depth_anything

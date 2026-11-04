@@ -61,7 +61,14 @@ For additional countries, review `dataset.split_crs` and the geographic extent
 before training; the default projected CRS is intended for the current region.
 
 Loss uses only finite, nonnegative AGBD labels with valid Sentinel inputs.
-Zero biomass is valid. All patches, including unlabeled and buffer patches,
+`dataset.max_agbd: 500.0` excludes labels above 500 Mg/ha from training,
+validation, test and label statistics; exactly 500 and zero remain valid.
+The filter is applied while reading processed arrays, so conversion does not
+need to be rerun and the stored labels are preserved. Set
+`dataset.max_agbd=null` to disable it, or change the threshold with a Hydra
+override, for example `python main.py dataset.max_agbd=500`.
+Predictions are not capped by this label filter.
+All patches, including unlabeled and buffer patches,
 remain in `predict_dataloader()` for later mapping. Input normalization uses
 only the geographic training region. The biomass scale is the 95th percentile
 of valid training labels (minimum scale 1 Mg/ha); it neither removes nor clips
@@ -152,6 +159,76 @@ Its timestamp and other artifacts were not supplied, so the folder contains
 only the available logs. The existing global `*.log` rule still ignores
 `main.log`; CSV history, JSON summaries, Slurm logs and checkpoints in `runs/`
 are not ignored.
+
+### Analyze a saved run
+
+Install the updated requirements (analysis plots use Matplotlib), then run:
+
+```bash
+python -m analysis.analyze_run --run-dir runs/agbd
+python -m analysis.evaluate_checkpoint --run-dir runs/agbd --device auto
+```
+
+The analysis commands live together in the `analysis/` package. Run them from
+the repository root with `python -m` as above.
+
+`analysis/analyze_run.py` merges sparse CSV log rows by epoch, plots RMSE/loss and the
+logged learning rates, and replays early stopping on the recorded validation
+trace. It also checks the saved geographic split against the processed arrays,
+reports label distributions and patch counts, and plots the split. Label
+statistics, percentiles and threshold counts/percentages are printed as tables
+in `report.md`. Results go to `runs/agbd/analysis/`: `report.md`,
+`analysis_report.json`, `history_by_epoch.csv`, `label_statistics.csv`,
+`label_statistics_by_period.csv`,
+`patch_audit.csv`, and just two plots: `learning_curves.png` and `split_map.png`.
+The period table groups labels by country/province/site/period and split,
+including empty splits. It reports patch counts and AGBD distributions, and
+warns when a period has no train, validation or test labels. The same table
+and warnings are included in `report.md` and `analysis_report.json`.
+Rerunning the script removes the obsolete `label_distributions.png` if present.
+Use `--history-only` when the processed data is unavailable.
+
+`analysis/evaluate_checkpoint.py` loads the trained checkpoint with strict weight
+matching and evaluates all labeled patches in the saved train/validation
+split. It uses the saved normalization, target scale and training target mean;
+it does not fit a model or recompute the split. Results go to
+`runs/agbd/evaluation/`: `report.md`, `evaluation_metrics.json`,
+`predictions.csv`, `per_patch.csv`, `by_agbd_bin.csv`, `by_region_period.csv`,
+and prediction/residual/patch-error PNGs. Residual and bias mean prediction
+minus target. RMSE, MAE and bias use Mg/ha; the mean of patch RMSEs is reported
+separately from pooled pixel-weighted RMSE. Bin intervals are left-inclusive
+and right-exclusive: `[0,30)`, `[30,100)`, `[100,200)`, `[200,inf)`.
+
+Both scripts accept `--data-root /path/to/processed`. Old IDs without a country
+prefix can be mapped to a unique country folder. If multiple countries match,
+select one with `--country-prefix VietNam`; no match is silently guessed.
+The audit checks geometry, array/mask shapes, per-patch label counts, and saved
+training normalization/label statistics. Original data hashes were not saved,
+so these checks cannot prove that every file is byte-identical to the training
+data. Extra current patches are not added to the saved split.
+Both commands use the label ceiling recorded in the saved run's dataset
+configuration. Older runs without `max_agbd` retain their original unbounded
+label policy; changing the current default does not reinterpret old runs.
+
+The evaluator resolves the copied checkpoint under the run's `checkpoints/`
+directory before using its recorded server path. Override paths with
+`--checkpoint /path/to/model.ckpt` and
+`--hf-model-path /path/to/offline_models/depth-any-canopy-small` if needed.
+`--device auto` selects CUDA when available, otherwise CPU. CPU evaluation
+defaults to four threads; use `--cpu-threads`, `--batch-size` and `--num-workers`
+to adjust resources. Only local model configuration and the trained checkpoint
+are loaded; the original RGB pretrained weights are not reloaded.
+
+Test prediction is opt-in. After model selection, evaluate it separately:
+
+```bash
+python -m analysis.evaluate_checkpoint --run-dir runs/agbd --splits test --output-dir runs/agbd/evaluation-test
+```
+
+Dataset label statistics include all saved partitions, but the default evaluator
+does not predict the test partition. Pixel counts do not imply independent
+footprint counts. Sparse groups (especially a two-patch test) need to be
+interpreted with their spatial coverage and label concentration.
 
 To transfer the model to an offline server, copy and extract the prepared model
 archive so that `offline_models/depth-any-canopy-small/config.json` and

@@ -29,9 +29,14 @@ class PatchPair:
         return f"{self.region}/{self.name}"
 
 
-def valid_gedi_mask(gedi: np.ndarray) -> np.ndarray:
-    """AGBD is valid when finite and nonnegative; zero biomass is a label."""
-    return np.isfinite(gedi) & (gedi >= 0)
+def valid_gedi_mask(gedi: np.ndarray, max_agbd: float | None = None) -> np.ndarray:
+    """Keep finite nonnegative labels, optionally excluding AGBD above a ceiling."""
+    valid = np.isfinite(gedi) & (gedi >= 0)
+    if max_agbd is not None:
+        if not np.isfinite(max_agbd) or max_agbd < 0:
+            raise ValueError("max_agbd must be finite and nonnegative, or None.")
+        valid &= gedi <= max_agbd
+    return valid
 
 
 def _input_mask(image: np.ndarray, path: Path) -> np.ndarray:
@@ -62,7 +67,7 @@ def _validated_bounds(metadata: dict, path: Path, split_crs: rasterio.crs.CRS) -
 
 def discover_patch_pairs(
     data_root: str | Path, regions: str | Sequence[str] | None = None,
-    expected_channels: int = 14, split_crs: str = "EPSG:32648",
+    expected_channels: int = 14, split_crs: str = "EPSG:32648", max_agbd: float | None = None,
 ) -> list[PatchPair]:
     """Read processed patches recursively, including country folders and unlabeled patches."""
     root = Path(data_root).expanduser().resolve()
@@ -96,7 +101,7 @@ def discover_patch_pairs(
                 raise ValueError(f"{files['input'][stem]} has shape {image.shape}; expected ({expected_channels}, H, W).")
             if target.ndim != 2 or image.shape[-2:] != target.shape:
                 raise ValueError(f"Spatial mismatch for {region}/{stem}: input={image.shape}, AGBD={target.shape}.")
-            valid = valid_gedi_mask(target) & _input_mask(image, files["input_valid_mask"][stem])
+            valid = valid_gedi_mask(target, max_agbd) & _input_mask(image, files["input_valid_mask"][stem])
             metadata_path = files["metadata"][stem]
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             bounds = _validated_bounds(metadata, metadata_path, metric_crs)
@@ -170,27 +175,29 @@ def compute_channel_stats(pairs: Iterable[PatchPair], expected_channels: int) ->
     return mean.astype(np.float32), np.sqrt(np.maximum(variance, 1e-12)).astype(np.float32)
 
 
-def compute_target_stats(pairs: Iterable[PatchPair], quantile: float) -> tuple[float, float, int]:
+def compute_target_stats(pairs: Iterable[PatchPair], quantile: float, max_agbd: float | None = None) -> tuple[float, float, int]:
     if not 0 < quantile <= 1:
         raise ValueError("target_scale_quantile must be in (0, 1].")
     values = []
     for pair in pairs:
         image = np.load(pair.sentinel_path, mmap_mode="r", allow_pickle=False)
         target = np.load(pair.gedi_path, mmap_mode="r", allow_pickle=False)
-        valid = valid_gedi_mask(target) & _input_mask(image, pair.input_valid_mask_path)
+        valid = valid_gedi_mask(target, max_agbd) & _input_mask(image, pair.input_valid_mask_path)
         values.append(np.asarray(target[valid], dtype=np.float64))
     labels = np.concatenate(values)
     if not labels.size:
         raise ValueError("No valid training AGBD labels are available for biomass scaling.")
-    # The scale never clips or removes high biomass. Zero-heavy training data
+    # Scaling never clips the retained labels. Zero-heavy training data
     # still needs a positive denominator.
     scale = max(float(np.quantile(labels, quantile)), 1.0)
     return scale, float(labels.mean()), int(labels.size)
 
 
 class GediSentinelDataset(Dataset):
-    def __init__(self, pairs: Sequence[PatchPair], mean: np.ndarray, std: np.ndarray) -> None:
+    def __init__(self, pairs: Sequence[PatchPair], mean: np.ndarray, std: np.ndarray,
+                 max_agbd: float | None = None) -> None:
         self.pairs = list(pairs)
+        self.max_agbd = max_agbd
         self.mean = torch.from_numpy(mean).view(-1, 1, 1)
         self.std = torch.from_numpy(std).view(-1, 1, 1)
 
@@ -202,7 +209,7 @@ class GediSentinelDataset(Dataset):
         image_np = np.asarray(np.load(pair.sentinel_path, allow_pickle=False), dtype=np.float32)
         target_np = np.asarray(np.load(pair.gedi_path, allow_pickle=False), dtype=np.float32)
         input_valid = _input_mask(image_np, pair.input_valid_mask_path)
-        valid = valid_gedi_mask(target_np) & input_valid
+        valid = valid_gedi_mask(target_np, self.max_agbd) & input_valid
         image = torch.from_numpy(image_np.copy())
         image = torch.where(torch.isfinite(image), image, self.mean)
         image = (image - self.mean) / self.std
@@ -217,18 +224,20 @@ class GediSentinelDataModule(L.LightningDataModule):
         expected_channels: int = 14, batch_size: int = 1, num_workers: int = 0,
         train_fraction: float = 0.6, val_fraction: float = 0.2, buffer_m: float = 1000.0,
         split_crs: str = "EPSG:32648", target_scale_quantile: float = 0.95,
+        max_agbd: float | None = None,
     ) -> None:
         super().__init__()
         self.data_root, self.regions = data_root, regions
         self.expected_channels, self.batch_size, self.num_workers = expected_channels, batch_size, num_workers
         self.train_fraction, self.val_fraction, self.buffer_m = train_fraction, val_fraction, buffer_m
         self.split_crs, self.target_scale_quantile = split_crs, target_scale_quantile
+        self.max_agbd = max_agbd
         self._is_ready = False
 
     def setup(self, stage: str | None = None) -> None:
         if self._is_ready:
             return
-        all_pairs = discover_patch_pairs(self.data_root, self.regions, self.expected_channels, self.split_crs)
+        all_pairs = discover_patch_pairs(self.data_root, self.regions, self.expected_channels, self.split_crs, self.max_agbd)
         geographic, audit = geographic_split(all_pairs, self.train_fraction, self.val_fraction, self.buffer_m)
         labeled = {name: [p for p in geographic[name] if p.valid_pixels > 0] for name in ("train", "val", "test")}
         for name, pairs in labeled.items():
@@ -238,14 +247,15 @@ class GediSentinelDataModule(L.LightningDataModule):
         # Include unlabeled inputs only from the training geographic region;
         # held-out inputs and labels never influence normalization/scaling.
         mean, std = compute_channel_stats(geographic["train"], self.expected_channels)
-        self.target_scale, self.train_target_mean, train_labels = compute_target_stats(labeled["train"], self.target_scale_quantile)
+        self.target_scale, self.train_target_mean, train_labels = compute_target_stats(labeled["train"], self.target_scale_quantile, self.max_agbd)
         for name, pairs in labeled.items():
-            setattr(self, f"{name}_dataset", GediSentinelDataset(pairs, mean, std))
-        self.predict_dataset = GediSentinelDataset(all_pairs, mean, std)
+            setattr(self, f"{name}_dataset", GediSentinelDataset(pairs, mean, std, self.max_agbd))
+        self.predict_dataset = GediSentinelDataset(all_pairs, mean, std, self.max_agbd)
         self.normalization_mean, self.normalization_std = mean, std
         self.split_summary = {
             **audit, "split_crs": self.split_crs, "train_fraction": self.train_fraction,
             "val_fraction": self.val_fraction, "target": "agbd", "target_units": "Mg/ha",
+            "max_agbd": self.max_agbd,
             "target_scale": self.target_scale, "target_scale_quantile": self.target_scale_quantile,
             "train_target_mean": self.train_target_mean, "train_label_pixels": train_labels,
             "normalization_mean": mean.tolist(), "normalization_std": std.tolist(),
