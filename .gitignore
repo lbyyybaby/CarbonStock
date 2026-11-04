@@ -164,7 +164,8 @@ cython_debug/
 # Downloaded model artifacts are transferred separately from source control.
 offline_models/
 
-# Root-level fallback Slurm logs; runs/ is versioned for server/local transfers.
+# Generated training runs and root-level fallback Slurm logs.
+/runs/
 /train-*.out
 /train-*.err
 /slurm-*.out
