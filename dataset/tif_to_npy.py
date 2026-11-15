@@ -64,14 +64,14 @@ def label_band_contract(src, quality_filtered_provenance: str | None) -> tuple[i
     return targets[0], flag_indices, metadata
 
 
-def parse_source_ids(tif_path: Path) -> tuple[str, str, str, str]:
+def parse_source_ids(tif_path: Path) -> tuple[str, str, str]:
     match = re.fullmatch(
-        r"([^_]+)_([^_]+)_([^_]+)_(\d{4}_\d{4})_S1_S2_GEDI", tif_path.stem
+        r"([^_]+)_([^_]+)_(\d{4}_\d{4})_S1_S2_GEDI", tif_path.stem
     )
     if match is None:
         raise ValueError(
             f"Invalid filename: {tif_path.name}. Expected "
-            "<country>_<province>_<forest>_<YYYY_YYYY>_S1_S2_GEDI.tif"
+            "<country>_<province>_<YYYY_YYYY>_S1_S2_GEDI.tif"
         )
     return match.groups()
 
@@ -84,7 +84,7 @@ def write_json(path: Path, metadata: dict) -> None:
 
 
 def prepare_output(directory: Path, overwrite: bool) -> None:
-    # Only inspect this country/province/site/window; other windows are untouched.
+    # Only inspect this country/province/window; other windows are untouched.
     files = [
         path
         for folder in OUTPUT_FOLDERS
@@ -152,8 +152,8 @@ def convert_tif(
     quality_filtered_provenance: str | None = None,
 ) -> dict:
     tif_path = Path(tif_path).expanduser().resolve()
-    country, province, site, period = parse_source_ids(tif_path)
-    directory = Path(output_root).expanduser().resolve() / country / province / site / period
+    country, province, period = parse_source_ids(tif_path)
+    directory = Path(output_root).expanduser().resolve() / country / province / period
     if patch_size <= 0:
         raise ValueError("patch_size must be positive.")
 
@@ -167,7 +167,7 @@ def convert_tif(
         nodata = [str(v) if v is not None and not np.isfinite(v) else v for v in src.nodatavals]
         common = {
             **label_metadata,
-            "country_id": country, "province_id": province, "site_id": site, "window_id": period,
+            "country_id": country, "province_id": province, "window_id": period,
             "source_tif": str(tif_path),
             "crs": {"value": src.crs.to_string(), "epsg": src.crs.to_epsg()},
             "resolution": {
@@ -223,7 +223,7 @@ def convert_tif(
         manifest = {
             **label_metadata,
             **counts,
-            "country_id": country, "province_id": province, "site_id": site, "window_id": period,
+            "country_id": country, "province_id": province, "window_id": period,
             "source_tif": str(tif_path),
             "source_shape": {"bands": src.count, "height": src.height, "width": src.width},
             "patch_size": patch_size,
@@ -242,17 +242,19 @@ def convert_tif(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tif_paths", nargs="*", type=Path)
+    parser.add_argument("--raw-root", type=Path, default=RAW_DIR,
+                        help="Recursively discover S1/S2/GEDI TIFFs below this directory when no paths are given.")
     parser.add_argument("--output-root", type=Path, default=DATA_ROOT / "processed")
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
-    parser.add_argument("--overwrite", action="store_true", help="Replace generated files in the matching country/province/site/window.")
+    parser.add_argument("--overwrite", action="store_true", help="Replace generated files in the matching country/province/window.")
     parser.add_argument(
         "--quality-filtered-provenance",
         help="Optional provenance confirming GEDI L4A quality filtering before temporal aggregation.",
     )
     args = parser.parse_args()
-    tif_paths = args.tif_paths or sorted(RAW_DIR.glob("*_S1_S2_GEDI.tif"))
+    tif_paths = args.tif_paths or sorted(args.raw_root.rglob("*_S1_S2_GEDI.tif"))
     if not tif_paths:
-        parser.error(f"No matching TIFF files found in {RAW_DIR}.")
+        parser.error(f"No matching TIFF files found in {args.raw_root}.")
     for tif_path in tif_paths:
         convert_tif(
             tif_path, args.output_root, args.patch_size, args.overwrite,

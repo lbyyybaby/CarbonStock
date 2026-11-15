@@ -1,3 +1,4 @@
+# ViT-S with pixel-weighted MSE and ReduceLROnPlateau.
 seed: 42
 # The Slurm launcher supplies one directory for logs and model outputs.
 output_dir: ${oc.env:CARBONSTOCK_RUN_DIR,runs/agbd/${now:%Y-%m-%d_%H-%M-%S}}
@@ -5,12 +6,12 @@ run_test: false
 
 early_stopping:
   enabled: true
-  patience: 5
+  patience: 12
   min_delta: 0.1  # Validation RMSE improvement in Mg/ha.
 
 dataset:
   # Resolved relative to this repository, even if Hydra changes the run directory.
-  data_root: ../../data/CarbonStock/processed
+  data_root: ../../data/CarbonStock/processed/VietNam/CaMau
   regions: null
   expected_channels: 14
   batch_size: 4
@@ -21,18 +22,25 @@ dataset:
   split_crs: EPSG:32648
   target_scale_quantile: 0.95
   max_agbd: 500.0  # Exclude labels >500 Mg/ha; null disables this filter.
+  expected_input_bands: [S2_B1, S2_B2, S2_B3, S2_B4, S2_B5, S2_B6, S2_B7, S2_B8, S2_B8A, S2_B9, S2_B11, S2_B12, S1_VV, S1_VH]
 
 model:
   architecture: depth_anything
   encoder: vits
   in_channels: ${dataset.expected_channels}
   image_size: 252
-  lr: 5.0e-6
-  pretrained: true
+  lr: 3.0e-5
+  # false initializes the entire model randomly; only the HF config is read.
+  pretrained: false
   use_huggingface: true
   hf_model_path: offline_models/depth-any-canopy-small
   hf_local_files_only: true
   checkpoint_path: null
+  loss_weighting: pixel  # Align the training objective with pooled RMSE.
+  scheduler: plateau
+  plateau_patience: 2
+  plateau_factor: 0.5
+  plateau_min_lr: 1.0e-7
 
 trainer:
   accelerator: gpu

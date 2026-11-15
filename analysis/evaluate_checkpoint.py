@@ -44,13 +44,16 @@ def load_model(path, summary, hf_override):
     for key in ("target_scale", "train_target_mean"):
         if not np.isclose(parameters[key], summary[key], rtol=1e-6, atol=1e-6):
             raise ValueError(f"Checkpoint and data_summary.json disagree about {key}.")
-    for key in ("architecture", "encoder", "in_channels", "image_size", "use_huggingface"):
-        if parameters.get(key) != summary["config"]["model"].get(key):
+    defaults = dict.fromkeys(("architecture", "encoder", "in_channels", "image_size", "use_huggingface"))
+    defaults.update(output_activation="relu", input_adaptation="random", loss_function="mse")
+    # Inference options without tensors must also match when restoring weights.
+    for key, default in defaults.items():
+        if parameters.get(key, default) != summary["config"]["model"].get(key, default):
             raise ValueError(f"Checkpoint and training configuration disagree about {key}.")
     # Build the architecture from local config, then load ALL trained weights strictly.
     # Reloading the original pretrained RGB weights is unnecessary here.
     parameters.update(pretrained=False, checkpoint_path=None, hf_local_files_only=True)
-    if parameters.get("use_huggingface") and parameters.get("architecture") != "tiny":
+    if parameters.get("use_huggingface"):
         candidates = [hf_override] if hf_override else [REPOSITORY / summary["config"]["model"]["hf_model_path"],
                                                        Path(parameters["hf_model_path"])]
         existing = [Path(p).expanduser().resolve() for p in candidates if p is not None and (Path(p).expanduser() / "config.json").is_file()]
@@ -181,8 +184,7 @@ def main():
                     raise ValueError(f"Invalid predictions or changed labels for {saved_id}.")
                 grouped[patch.split].append((truth, prediction))
                 metadata = patch.metadata
-                tags = {name: metadata.get(key, "") for name, key in (("country", "country_id"), ("province", "province_id"),
-                                                                       ("site", "site_id"), ("period", "window_id"))}
+                tags = patch.tags
                 for name, value in tags.items():
                     group_metadata.setdefault((patch.split, name, str(value)), []).append((truth, prediction))
                 patch_rows.append({"split": patch.split, "saved_patch_id": saved_id, "resolved_patch_id": patch.resolved_id,
@@ -234,12 +236,10 @@ def main():
     write_csv(output / "by_agbd_bin.csv", biomass_rows)
     write_csv(output / "by_region_period.csv", metadata_rows)
     plot_patch_errors(output, patch_rows, splits)
-    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
+        checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     report = {"created_at_utc": datetime.now(timezone.utc).isoformat(), "run_dir": str(run), "checkpoint": str(path),
-              "checkpoint_sha256": digest.hexdigest(), "checkpoint_epoch_index": checkpoint_epoch,
+              "checkpoint_sha256": checkpoint_hash, "checkpoint_epoch_index": checkpoint_epoch,
               "splits_evaluated": splits, "target_units": "Mg/ha", "residual_definition": "prediction - target",
               "model_mode": "eval, inference_mode, float32; no training or prediction clipping",
               "device": device, "torch_version": torch.__version__, "original_torch_version": original_metrics.get("runtime", {}).get("torch_version"),

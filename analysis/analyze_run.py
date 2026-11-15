@@ -133,6 +133,11 @@ class SavedPatch:
     def valid_pixels(self):
         return int(self.labels.size)
 
+    @property
+    def tags(self):
+        return {name: self.metadata.get(key, "") for name, key in
+                (("country", "country_id"), ("province", "province_id"), ("site", "site_id"), ("period", "window_id"))}
+
 
 def resolve_data_root(summary, override=None):
     path = Path(override or summary["config"]["dataset"]["data_root"]).expanduser()
@@ -148,8 +153,7 @@ def summarize_periods(patches):
     """Include empty splits so missing labels in a period remain visible."""
     groups = {}
     for patch in patches:
-        key = tuple(str(patch.metadata.get(field, "")) for field in
-                    ("country_id", "province_id", "site_id", "window_id"))
+        key = tuple(str(value) for value in patch.tags.values())
         groups.setdefault(key, []).append(patch)
     rows, warnings = [], []
     for key, group in sorted(groups.items()):
@@ -172,8 +176,7 @@ def audit_dataset(summary, data_root, country_prefix=None):
     No new split is computed. An optional single country level may precede old IDs.
     Counts/statistics are checks, not a byte-level fingerprint of the old dataset.
     """
-    from rasterio.warp import transform_bounds
-    from dataset.sentinel_gedi_canopy import valid_gedi_mask
+    from dataset.sentinel_gedi_canopy import _input_mask, _validated_bounds, valid_gedi_mask
 
     saved = summary["split"]["patches"]
     if not saved or len({row["patch_id"] for row in saved}) != len(saved):
@@ -209,22 +212,14 @@ def audit_dataset(summary, data_root, country_prefix=None):
         directory = metadata_path.parent.parent
         name = relative.name
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if (metadata.get("target"), metadata.get("target_units"), metadata.get("label_product")) != ("agbd", "Mg/ha", "GEDI_L4A"):
-            raise ValueError(f"Incorrect label contract: {metadata_path}")
-        crs = metadata["crs"]
-        crs = crs["value"] if isinstance(crs, dict) else crs
-        bounds = tuple(metadata["bounds"][key] for key in ("left", "bottom", "right", "top"))
-        projected = transform_bounds(crs, summary["split"]["split_crs"], *bounds, densify_pts=21)
+        projected = _validated_bounds(metadata, metadata_path, summary["split"]["split_crs"])
         if not np.allclose(projected, row["bounds_m"], atol=1e-3, rtol=0):
             raise ValueError(f"Footprint changed for {relative}.")
         image = np.load(directory / "input" / name, mmap_mode="r", allow_pickle=False)
         target = np.load(directory / "gedi" / name, mmap_mode="r", allow_pickle=False)
-        mask = np.load(directory / "input_valid_mask" / name, mmap_mode="r", allow_pickle=False)
         if image.ndim != 3 or image.shape[0] != channels or image.shape[1:] != target.shape or target.ndim != 2:
             raise ValueError(f"Invalid array shapes for {relative}.")
-        if mask.shape != target.shape or mask.dtype != np.bool_:
-            raise ValueError(f"Invalid input mask for {relative}.")
-        valid_input = np.asarray(mask) & np.isfinite(image).all(axis=0)
+        valid_input = _input_mask(image, directory / "input_valid_mask" / name)
         labels = np.asarray(target[valid_gedi_mask(target, max_agbd) & valid_input], dtype=np.float64)
         if labels.size != row["valid_label_pixels"]:
             raise ValueError(f"Label count changed for {relative}: {labels.size} != {row['valid_label_pixels']}.")
@@ -385,8 +380,7 @@ def main():
         write_csv(output / "label_statistics_by_period.csv", report["data_audit"]["period_statistics"])
         rows = [{"saved_patch_id": p.saved_id, "resolved_patch_id": p.resolved_id, "split": p.split,
                  "valid_label_pixels": p.valid_pixels, "fit_eligible": p.split != "excluded" and p.valid_pixels > 0,
-                 "country": p.metadata.get("country_id", ""), "province": p.metadata.get("province_id", ""),
-                 "site": p.metadata.get("site_id", ""), "period": p.metadata.get("window_id", ""),
+                 **p.tags,
                  "label_max": float(p.labels.max()) if p.valid_pixels else None} for p in patches]
         write_csv(output / "patch_audit.csv", rows)
         plot_split_map(output, patches, summary)

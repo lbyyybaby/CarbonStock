@@ -7,7 +7,6 @@ from typing import Literal
 import lightning as L
 import torch
 import torch.nn.functional as F
-from torch import nn
 from torchmetrics import Metric, SumMetric
 
 
@@ -32,24 +31,6 @@ class ValidPixelRMSE(Metric):
         return torch.sqrt(self.squared_error_sum / self.pixel_count.clamp_min(1))
 
 
-class TinyCanopyRegressor(nn.Module):
-    """Fast offline model used only to exercise the complete pipeline."""
-
-    def __init__(self, in_channels: int) -> None:
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, 1, kernel_size=1),
-            nn.Softplus(),
-        )
-
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        return self.network(image).squeeze(1)
-
-
 class DepthAnythingV2Module(L.LightningModule):
     model_configs = {
         "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
@@ -67,29 +48,62 @@ class DepthAnythingV2Module(L.LightningModule):
 
     def __init__(
         self,
-        architecture: Literal["tiny", "depth_anything"] = "tiny",
+        architecture: Literal["depth_anything"] = "depth_anything",
         encoder: Literal["vits", "vitb", "vitl", "vitg"] = "vits",
         in_channels: int = 14,
         image_size: int = 252,
         target_scale: float = 1.0,
         train_target_mean: float = 0.0,
-        lr: float = 5e-6,
+        lr: float = 3e-5,
         pretrained: bool = False,
         use_huggingface: bool = False,
         hf_model_path: str | None = None,
         hf_local_files_only: bool = True,
         checkpoint_path: str | None = None,
-        **_: object,
+        loss_weighting: Literal["batch", "pixel"] = "pixel",
+        train_mean_valid_pixels: float | None = None,
+        scheduler: Literal["plateau"] = "plateau",
+        plateau_patience: int = 2,
+        plateau_factor: float = 0.5,
+        plateau_min_lr: float = 1e-7,
+        **legacy_hparams: object,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        if architecture != "depth_anything":
+            raise ValueError("Only the depth_anything ViT architecture is supported.")
+        # Older Plateau checkpoints contain options from exploratory runs.
+        # Accept their inactive defaults, and reject changed inference semantics.
+        for name, value in {
+            "input_adaptation": "random", "reset_output_head": False,
+            "output_activation": "relu", "backbone_lr_factor": 1.0,
+            "augmentation": "none", "loss_function": "mse",
+        }.items():
+            if legacy_hparams.get(name, value) != value:
+                raise ValueError(f"Only {name}={value!r} is supported.")
         if not math.isfinite(target_scale) or target_scale <= 0:
             raise ValueError("model.target_scale must be finite and positive.")
-        self._uses_huggingface = architecture != "tiny" and use_huggingface
+        if not math.isfinite(lr) or lr <= 0:
+            raise ValueError("model.lr must be finite and positive.")
+        if loss_weighting not in {"batch", "pixel"}:
+            raise ValueError("model.loss_weighting must be 'batch' or 'pixel'.")
+        if loss_weighting == "pixel" and (
+            train_mean_valid_pixels is None
+            or not math.isfinite(train_mean_valid_pixels)
+            or train_mean_valid_pixels <= 0
+        ):
+            raise ValueError("Pixel weighting requires a finite positive model.train_mean_valid_pixels.")
+        if scheduler != "plateau":
+            raise ValueError("Only model.scheduler=plateau is supported.")
+        if isinstance(plateau_patience, bool) or not isinstance(plateau_patience, int) or plateau_patience < 0:
+            raise ValueError("model.plateau_patience must be a nonnegative integer.")
+        if not math.isfinite(plateau_factor) or not 0 < plateau_factor < 1:
+            raise ValueError("model.plateau_factor must be finite and between zero and one.")
+        if not math.isfinite(plateau_min_lr) or plateau_min_lr < 0:
+            raise ValueError("model.plateau_min_lr must be finite and nonnegative.")
+        self._uses_huggingface = use_huggingface
 
-        if architecture == "tiny":
-            self.model = TinyCanopyRegressor(in_channels)
-        elif use_huggingface:
+        if use_huggingface:
             if self.size_map[encoder] is None:
                 raise ValueError(f"No Hugging Face model is configured for {encoder}.")
             import transformers
@@ -206,18 +220,18 @@ class DepthAnythingV2Module(L.LightningModule):
             betas=(0.9, 0.999),
             weight_decay=0.01,
         )
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            total_steps=self.trainer.estimated_stepping_batches,
-            max_lr=self.hparams.lr,
-            pct_start=0.05,
-            cycle_momentum=False,
-            div_factor=1e9,
-            final_div_factor=1e4,
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=self.hparams.plateau_factor,
+            patience=self.hparams.plateau_patience, threshold=0.1,
+            threshold_mode="abs", min_lr=self.hparams.plateau_min_lr,
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+            "lr_scheduler": {
+                "scheduler": scheduler, "interval": "epoch",
+                "monitor": "val_RMSE", "reduce_on_plateau": True,
+                "strict": True,
+            },
         }
 
     def _predict(
@@ -266,7 +280,14 @@ class DepthAnythingV2Module(L.LightningModule):
 
         valid_raw_prediction = raw_prediction_normalized[valid]
         valid_target_normalized = target_normalized[valid]
-        mse = F.mse_loss(valid_raw_prediction, valid_target_normalized)
+        mse = (valid_raw_prediction - valid_target_normalized).square().mean()
+        optimization_loss = mse
+        if stage == "train" and self.hparams.loss_weighting == "pixel":
+            # A fixed training-only denominator avoids giving sparse batches
+            # the same total influence as dense batches. Under uniform patch
+            # sampling this estimates the pooled valid-pixel MSE objective.
+            denominator = self.hparams.train_mean_valid_pixels * target_agbd.shape[0]
+            optimization_loss = optimization_loss * (valid_count / denominator)
         prediction_agbd = (
             raw_prediction_normalized.detach() * self.hparams.target_scale
         )
@@ -293,11 +314,14 @@ class DepthAnythingV2Module(L.LightningModule):
             prog_bar=stage == "train",
             batch_size=valid_count,
         )
+        self.log(f"{stage}_Loss(objective)", optimization_loss,
+                 on_step=False, on_epoch=True, batch_size=valid_count)
         if stage == "train":
             valid_raw_prediction = valid_raw_prediction.detach().float()
             diagnostics = {
                 "train_raw_pred_mean_normalized": valid_raw_prediction.mean(),
                 "train_below_0_pct": (valid_raw_prediction < 0).float().mean() * 100,
+                "train_zero_pct": (valid_raw_prediction == 0).float().mean() * 100,
             }
             for name, value in diagnostics.items():
                 self.log(
@@ -329,7 +353,7 @@ class DepthAnythingV2Module(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
-        return mse
+        return optimization_loss
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor | None:
         return self._shared_step(batch, "train")

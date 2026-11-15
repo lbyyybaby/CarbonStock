@@ -22,3 +22,8 @@ job_id="$(sbatch --parsable \
   "$repository_dir/train.slurm" "$@")"
 printf '%s\n' "$job_id" > "$run_dir/slurm_job_id.txt"
 printf 'Submitted batch job: %s\n' "$job_id"
+printf 'Slurm manages this job; you can disconnect SSH after submission.\n'
+printf 'Status: squeue -j %s\n' "${job_id%%;*}"
+printf 'History: sacct -j %s --format=JobID,JobName,State,Elapsed,ExitCode\n' "${job_id%%;*}"
+printf 'Training log: %s/train-%s.out\n' "$run_dir" "${job_id%%;*}"
+printf 'Error/progress log: %s/train-%s.err\n' "$run_dir" "${job_id%%;*}"

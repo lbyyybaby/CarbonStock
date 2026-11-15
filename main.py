@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import platform
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from importlib.metadata import version
 
 import hydra
 import lightning as L
@@ -40,16 +43,23 @@ def main(config: DictConfig) -> None:
 
     data_module = GediSentinelDataModule(**dataset_config)
     # Split first: neither normalization nor biomass scale may see val/test.
+    data_started = time.perf_counter()
     data_module.setup("fit")
+    data_setup_seconds = time.perf_counter() - data_started
     model_config["target_scale"] = data_module.target_scale
     model_config["train_target_mean"] = data_module.train_target_mean
+    train_counts = data_module.split_summary["counts"]["train"]
+    model_config["train_mean_valid_pixels"] = train_counts["valid_label_pixels"] / train_counts["labeled_patches"]
+    model_started = time.perf_counter()
     model = DepthAnythingV2Module(**model_config)
+    model_setup_seconds = time.perf_counter() - model_started
     output_dir = Path(resolve_repository_path(config.output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "target": "agbd", "target_units": "Mg/ha",
         "target_scale": data_module.target_scale,
         "train_target_mean": data_module.train_target_mean,
+        "loss_setup": {"loss_function": "mse"},
         "normalization_mean": data_module.normalization_mean.tolist(),
         "normalization_std": data_module.normalization_std.tolist(),
         "split": data_module.split_summary,
@@ -96,6 +106,9 @@ def main(config: DictConfig) -> None:
         "early_stopping_patience": config.early_stopping.patience,
         "early_stopping_min_delta_mg_ha": config.early_stopping.min_delta,
         "fit_seconds": fit_seconds,
+        "loss_weighting": model.hparams.loss_weighting,
+        "loss_function": "mse",
+        "train_mean_valid_pixels": model.hparams.train_mean_valid_pixels,
     }
     test_started = time.perf_counter()
     if config.run_test:
@@ -113,6 +126,14 @@ def main(config: DictConfig) -> None:
         "accelerator": type(trainer.accelerator).__name__,
         "cpu_threads": torch.get_num_threads(),
         "logical_cpus": os.cpu_count(),
+        "python_version": platform.python_version(),
+        "package_versions": {name: version(name) for name in ("torch", "torchvision", "lightning", "transformers", "numpy", "rasterio")},
+        "cuda_version": torch.version.cuda,
+        "gpu_name": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+        "data_setup_seconds": data_setup_seconds,
+        "model_setup_seconds": model_setup_seconds,
+        "source_sha256": {name: hashlib.sha256((repository_root / name).read_bytes()).hexdigest()
+                          for name in ("main.py", "lightning_model.py", "dataset/sentinel_gedi_canopy.py")},
     }
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, allow_nan=False) + "\n", encoding="utf-8"

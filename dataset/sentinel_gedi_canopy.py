@@ -68,6 +68,7 @@ def _validated_bounds(metadata: dict, path: Path, split_crs: rasterio.crs.CRS) -
 def discover_patch_pairs(
     data_root: str | Path, regions: str | Sequence[str] | None = None,
     expected_channels: int = 14, split_crs: str = "EPSG:32648", max_agbd: float | None = None,
+    expected_input_bands: Sequence[str] | None = None,
 ) -> list[PatchPair]:
     """Read processed patches recursively, including country folders and unlabeled patches."""
     root = Path(data_root).expanduser().resolve()
@@ -81,6 +82,9 @@ def discover_patch_pairs(
         directories = [root / name for name in names]
     pairs: list[PatchPair] = []
     seen_ids: set[str] = set()
+    band_order = list(expected_input_bands) if expected_input_bands is not None else None
+    if band_order is not None and len(band_order) != expected_channels:
+        raise ValueError("expected_input_bands must have one name per input channel.")
     for directory in directories:
         region = directory.relative_to(root).as_posix()
         folders = {name: directory / name for name in ("input", "gedi", "input_valid_mask", "metadata")}
@@ -104,6 +108,13 @@ def discover_patch_pairs(
             valid = valid_gedi_mask(target, max_agbd) & _input_mask(image, files["input_valid_mask"][stem])
             metadata_path = files["metadata"][stem]
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            names = metadata.get("bands", {}).get("input")
+            if not isinstance(names, list) or len(names) != expected_channels or any(not name for name in names):
+                raise ValueError(f"{metadata_path}: require named input bands for every channel.")
+            if band_order is None:
+                band_order = names
+            if names != band_order:
+                raise ValueError(f"{metadata_path}: input band order {names} differs from expected {band_order}.")
             bounds = _validated_bounds(metadata, metadata_path, metric_crs)
             pair = PatchPair(region, f"{stem}.npy", files["input"][stem], files["gedi"][stem],
                              files["input_valid_mask"][stem], metadata_path, bounds, int(valid.sum()))
@@ -122,11 +133,13 @@ def geographic_split(
     """Fixed west/east strips based on all footprints, never labels or dates.
 
     Whole patches intersecting a boundary buffer are excluded from fitting.
+    A zero buffer permits touching partitions; patches straddling a split
+    boundary are still excluded rather than shared between partitions.
     """
     if not (0 < train_fraction < 1 and 0 < val_fraction < 1 and train_fraction + val_fraction < 1):
         raise ValueError("Require train_fraction > 0, val_fraction > 0, and their sum < 1 (independent test).")
-    if not np.isfinite(buffer_m) or buffer_m <= 0:
-        raise ValueError("buffer_m must be positive metres.")
+    if not np.isfinite(buffer_m) or buffer_m < 0:
+        raise ValueError("buffer_m must be nonnegative metres (zero disables the boundary buffer).")
     west = min(pair.bounds[0] for pair in pairs)
     east = max(pair.bounds[2] for pair in pairs)
     boundary1 = west + (east - west) * train_fraction
@@ -225,6 +238,7 @@ class GediSentinelDataModule(L.LightningDataModule):
         train_fraction: float = 0.6, val_fraction: float = 0.2, buffer_m: float = 1000.0,
         split_crs: str = "EPSG:32648", target_scale_quantile: float = 0.95,
         max_agbd: float | None = None,
+        expected_input_bands: Sequence[str] | None = None,
     ) -> None:
         super().__init__()
         self.data_root, self.regions = data_root, regions
@@ -232,12 +246,14 @@ class GediSentinelDataModule(L.LightningDataModule):
         self.train_fraction, self.val_fraction, self.buffer_m = train_fraction, val_fraction, buffer_m
         self.split_crs, self.target_scale_quantile = split_crs, target_scale_quantile
         self.max_agbd = max_agbd
+        self.expected_input_bands = expected_input_bands
         self._is_ready = False
 
     def setup(self, stage: str | None = None) -> None:
         if self._is_ready:
             return
-        all_pairs = discover_patch_pairs(self.data_root, self.regions, self.expected_channels, self.split_crs, self.max_agbd)
+        all_pairs = discover_patch_pairs(self.data_root, self.regions, self.expected_channels, self.split_crs,
+                                         self.max_agbd, self.expected_input_bands)
         geographic, audit = geographic_split(all_pairs, self.train_fraction, self.val_fraction, self.buffer_m)
         labeled = {name: [p for p in geographic[name] if p.valid_pixels > 0] for name in ("train", "val", "test")}
         for name, pairs in labeled.items():
