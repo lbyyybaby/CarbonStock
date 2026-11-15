@@ -129,6 +129,7 @@ def main():
     import torch
     from torch.utils.data import DataLoader
     from dataset.sentinel_gedi_canopy import GediSentinelDataset, PatchPair
+    from dataset.gedi_context import GediContext
     from rasterio.warp import transform
 
     torch.set_num_threads(args.cpu_threads)
@@ -155,7 +156,9 @@ def main():
                        bounds=p.bounds, valid_pixels=p.valid_pixels) for p in selected]
     dataset = GediSentinelDataset(pairs, np.asarray(summary["normalization_mean"], dtype=np.float32),
                                  np.asarray(summary["normalization_std"], dtype=np.float32),
-                                 max_agbd=summary["config"]["dataset"].get("max_agbd"))
+                                 max_agbd=summary["config"]["dataset"].get("max_agbd"),
+                                 gedi_context=GediContext(**summary["config"]["dataset"].get("gedi_context", {})),
+                                 target_scale=summary["target_scale"])
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers,
                         pin_memory=device == "cuda")
     output = (args.output_dir or run / "evaluation").expanduser().resolve()

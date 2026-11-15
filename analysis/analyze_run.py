@@ -177,6 +177,8 @@ def audit_dataset(summary, data_root, country_prefix=None):
     Counts/statistics are checks, not a byte-level fingerprint of the old dataset.
     """
     from dataset.sentinel_gedi_canopy import _input_mask, _validated_bounds, valid_gedi_mask
+    from dataset.gedi_context import GediContext, role_masks
+    context_config = GediContext(**summary["config"]["dataset"].get("gedi_context", {}))
 
     saved = summary["split"]["patches"]
     if not saved or len({row["patch_id"] for row in saved}) != len(saved):
@@ -220,7 +222,8 @@ def audit_dataset(summary, data_root, country_prefix=None):
         if image.ndim != 3 or image.shape[0] != channels or image.shape[1:] != target.shape or target.ndim != 2:
             raise ValueError(f"Invalid array shapes for {relative}.")
         valid_input = _input_mask(image, directory / "input_valid_mask" / name)
-        labels = np.asarray(target[valid_gedi_mask(target, max_agbd) & valid_input], dtype=np.float64)
+        _, query = role_masks(directory, name, valid_gedi_mask(target, max_agbd) & valid_input, context_config)
+        labels = np.asarray(target[query], dtype=np.float64)
         if labels.size != row["valid_label_pixels"]:
             raise ValueError(f"Label count changed for {relative}: {labels.size} != {row['valid_label_pixels']}.")
         if bool(row["fit_eligible"]) != (row["split"] != "excluded" and labels.size > 0):

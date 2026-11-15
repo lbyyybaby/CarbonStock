@@ -22,6 +22,10 @@ dataset:
   split_crs: EPSG:32648
   target_scale_quantile: 0.95
   max_agbd: 500.0  # Exclude labels >500 Mg/ha; null disables this filter.
+  gedi_context:
+    enabled: false
+    context_fraction: 0.2  # Fraction of eligible shots, not raster pixels; must be <1.
+    seed: 42
   expected_input_bands: [S2_B1, S2_B2, S2_B3, S2_B4, S2_B5, S2_B6, S2_B7, S2_B8, S2_B8A, S2_B9, S2_B11, S2_B12, S1_VV, S1_VH]
 
 model:

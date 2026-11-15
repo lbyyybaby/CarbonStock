@@ -46,6 +46,9 @@ def main(config: DictConfig) -> None:
     data_started = time.perf_counter()
     data_module.setup("fit")
     data_setup_seconds = time.perf_counter() - data_started
+    # Disk patches retain 14 Sentinel bands; context adds two channels at load time.
+    config.model.in_channels = data_module.input_channels
+    model_config["in_channels"] = data_module.input_channels
     model_config["target_scale"] = data_module.target_scale
     model_config["train_target_mean"] = data_module.train_target_mean
     train_counts = data_module.split_summary["counts"]["train"]

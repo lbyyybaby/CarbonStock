@@ -11,6 +11,7 @@ import rasterio
 import torch
 from rasterio.warp import transform_bounds
 from torch.utils.data import DataLoader, Dataset
+from .gedi_context import GediContext, role_masks
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,8 @@ class PatchPair:
     metadata_path: Path
     bounds: tuple[float, float, float, float]
     valid_pixels: int
+    context_pixels: int = 0
+    missing_shot_pixels: int = 0
 
     @property
     def patch_id(self) -> str:
@@ -69,6 +72,7 @@ def discover_patch_pairs(
     data_root: str | Path, regions: str | Sequence[str] | None = None,
     expected_channels: int = 14, split_crs: str = "EPSG:32648", max_agbd: float | None = None,
     expected_input_bands: Sequence[str] | None = None,
+    gedi_context: GediContext | None = None,
 ) -> list[PatchPair]:
     """Read processed patches recursively, including country folders and unlabeled patches."""
     root = Path(data_root).expanduser().resolve()
@@ -106,6 +110,8 @@ def discover_patch_pairs(
             if target.ndim != 2 or image.shape[-2:] != target.shape:
                 raise ValueError(f"Spatial mismatch for {region}/{stem}: input={image.shape}, AGBD={target.shape}.")
             valid = valid_gedi_mask(target, max_agbd) & _input_mask(image, files["input_valid_mask"][stem])
+            eligible_count = int(valid.sum())
+            context, valid = role_masks(directory, files["gedi"][stem].name, valid, gedi_context or GediContext())
             metadata_path = files["metadata"][stem]
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             names = metadata.get("bands", {}).get("input")
@@ -117,7 +123,8 @@ def discover_patch_pairs(
                 raise ValueError(f"{metadata_path}: input band order {names} differs from expected {band_order}.")
             bounds = _validated_bounds(metadata, metadata_path, metric_crs)
             pair = PatchPair(region, f"{stem}.npy", files["input"][stem], files["gedi"][stem],
-                             files["input_valid_mask"][stem], metadata_path, bounds, int(valid.sum()))
+                             files["input_valid_mask"][stem], metadata_path, bounds, int(valid.sum()),
+                             int(context.sum()), eligible_count - int(valid.sum()) - int(context.sum()))
             if pair.patch_id in seen_ids:
                 raise ValueError(f"Duplicate patch selection: {pair.patch_id}.")
             seen_ids.add(pair.patch_id)
@@ -188,7 +195,8 @@ def compute_channel_stats(pairs: Iterable[PatchPair], expected_channels: int) ->
     return mean.astype(np.float32), np.sqrt(np.maximum(variance, 1e-12)).astype(np.float32)
 
 
-def compute_target_stats(pairs: Iterable[PatchPair], quantile: float, max_agbd: float | None = None) -> tuple[float, float, int]:
+def compute_target_stats(pairs: Iterable[PatchPair], quantile: float, max_agbd: float | None = None,
+                         gedi_context: GediContext | None = None) -> tuple[float, float, int]:
     if not 0 < quantile <= 1:
         raise ValueError("target_scale_quantile must be in (0, 1].")
     values = []
@@ -196,6 +204,7 @@ def compute_target_stats(pairs: Iterable[PatchPair], quantile: float, max_agbd: 
         image = np.load(pair.sentinel_path, mmap_mode="r", allow_pickle=False)
         target = np.load(pair.gedi_path, mmap_mode="r", allow_pickle=False)
         valid = valid_gedi_mask(target, max_agbd) & _input_mask(image, pair.input_valid_mask_path)
+        _, valid = role_masks(pair.gedi_path.parent.parent, pair.name, valid, gedi_context or GediContext())
         values.append(np.asarray(target[valid], dtype=np.float64))
     labels = np.concatenate(values)
     if not labels.size:
@@ -208,9 +217,14 @@ def compute_target_stats(pairs: Iterable[PatchPair], quantile: float, max_agbd: 
 
 class GediSentinelDataset(Dataset):
     def __init__(self, pairs: Sequence[PatchPair], mean: np.ndarray, std: np.ndarray,
-                 max_agbd: float | None = None) -> None:
+                 max_agbd: float | None = None, gedi_context: GediContext | None = None,
+                 target_scale: float = 1.0) -> None:
         self.pairs = list(pairs)
         self.max_agbd = max_agbd
+        self.gedi_context = gedi_context or GediContext()
+        if not np.isfinite(target_scale) or target_scale <= 0:
+            raise ValueError("target_scale must be finite and positive.")
+        self.target_scale = target_scale
         self.mean = torch.from_numpy(mean).view(-1, 1, 1)
         self.std = torch.from_numpy(std).view(-1, 1, 1)
 
@@ -223,10 +237,17 @@ class GediSentinelDataset(Dataset):
         target_np = np.asarray(np.load(pair.gedi_path, allow_pickle=False), dtype=np.float32)
         input_valid = _input_mask(image_np, pair.input_valid_mask_path)
         valid = valid_gedi_mask(target_np, self.max_agbd) & input_valid
+        context, valid = role_masks(pair.gedi_path.parent.parent, pair.name, valid, self.gedi_context)
         image = torch.from_numpy(image_np.copy())
         image = torch.where(torch.isfinite(image), image, self.mean)
         image = (image - self.mean) / self.std
         image[:, ~torch.from_numpy(input_valid.copy())] = 0.0
+        if self.gedi_context.enabled:
+            context_values = np.zeros_like(target_np)
+            context_values[context] = target_np[context] / self.target_scale
+            image = torch.cat((image, torch.from_numpy(context_values).unsqueeze(0),
+                               torch.from_numpy(context.astype(np.float32)).unsqueeze(0)))
+            target_np = np.where(valid, target_np, np.nan)
         return {"image": image, "mask": torch.from_numpy(target_np.copy()),
                 "valid_mask": torch.from_numpy(valid.copy()), "patch_id": pair.patch_id}
 
@@ -239,6 +260,7 @@ class GediSentinelDataModule(L.LightningDataModule):
         split_crs: str = "EPSG:32648", target_scale_quantile: float = 0.95,
         max_agbd: float | None = None,
         expected_input_bands: Sequence[str] | None = None,
+        gedi_context: dict | None = None,
     ) -> None:
         super().__init__()
         self.data_root, self.regions = data_root, regions
@@ -247,13 +269,15 @@ class GediSentinelDataModule(L.LightningDataModule):
         self.split_crs, self.target_scale_quantile = split_crs, target_scale_quantile
         self.max_agbd = max_agbd
         self.expected_input_bands = expected_input_bands
+        self.gedi_context = GediContext(**(gedi_context or {}))
+        self.input_channels = expected_channels + (2 if self.gedi_context.enabled else 0)
         self._is_ready = False
 
     def setup(self, stage: str | None = None) -> None:
         if self._is_ready:
             return
         all_pairs = discover_patch_pairs(self.data_root, self.regions, self.expected_channels, self.split_crs,
-                                         self.max_agbd, self.expected_input_bands)
+                                         self.max_agbd, self.expected_input_bands, self.gedi_context)
         geographic, audit = geographic_split(all_pairs, self.train_fraction, self.val_fraction, self.buffer_m)
         labeled = {name: [p for p in geographic[name] if p.valid_pixels > 0] for name in ("train", "val", "test")}
         for name, pairs in labeled.items():
@@ -263,15 +287,23 @@ class GediSentinelDataModule(L.LightningDataModule):
         # Include unlabeled inputs only from the training geographic region;
         # held-out inputs and labels never influence normalization/scaling.
         mean, std = compute_channel_stats(geographic["train"], self.expected_channels)
-        self.target_scale, self.train_target_mean, train_labels = compute_target_stats(labeled["train"], self.target_scale_quantile, self.max_agbd)
+        self.target_scale, self.train_target_mean, train_labels = compute_target_stats(labeled["train"], self.target_scale_quantile, self.max_agbd, self.gedi_context)
         for name, pairs in labeled.items():
-            setattr(self, f"{name}_dataset", GediSentinelDataset(pairs, mean, std, self.max_agbd))
-        self.predict_dataset = GediSentinelDataset(all_pairs, mean, std, self.max_agbd)
+            setattr(self, f"{name}_dataset", GediSentinelDataset(pairs, mean, std, self.max_agbd, self.gedi_context, self.target_scale))
+        self.predict_dataset = GediSentinelDataset(all_pairs, mean, std, self.max_agbd, self.gedi_context, self.target_scale)
         self.normalization_mean, self.normalization_std = mean, std
         self.split_summary = {
             **audit, "split_crs": self.split_crs, "train_fraction": self.train_fraction,
             "val_fraction": self.val_fraction, "target": "agbd", "target_units": "Mg/ha",
             "max_agbd": self.max_agbd,
+            "gedi_context": {
+                "enabled": self.gedi_context.enabled, "sampler": "splitmix64_v1",
+                "context_fraction": self.gedi_context.context_fraction, "seed": self.gedi_context.seed,
+                "counts": {name: {"context_pixels": sum(p.context_pixels for p in pairs),
+                                  "query_pixels": sum(p.valid_pixels for p in pairs),
+                                  "missing_shot_pixels": sum(p.missing_shot_pixels for p in pairs)}
+                           for name, pairs in geographic.items()},
+            },
             "target_scale": self.target_scale, "target_scale_quantile": self.target_scale_quantile,
             "train_target_mean": self.train_target_mean, "train_label_pixels": train_labels,
             "normalization_mean": mean.tolist(), "normalization_std": std.tolist(),

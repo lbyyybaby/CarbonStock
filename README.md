@@ -82,6 +82,45 @@ python -m unittest discover -s tests -v
 
 ## Train
 
+### Optional GEDI context experiment
+
+The default remains Sentinel-only. Prepare aligned shot-ID patches once on the
+server (this adds `shot_number/` alongside `input/`, leaving Sentinel/AGBD arrays intact):
+
+```bash
+python dataset/prepare_shots.py --raw-root /home/yenlb/data/CarbonStock/raw --processed-root /home/yenlb/data/CarbonStock/processed/VietNam/CaMau
+```
+
+Enable the experiment and choose any context fraction in `[0, 1)`:
+
+```bash
+bash submit_train.sh dataset.gedi_context.enabled=true dataset.gedi_context.context_fraction=0.2
+bash submit_train.sh dataset.gedi_context.enabled=true dataset.gedi_context.context_fraction=0.5
+# Original 14-channel experiment:
+bash submit_train.sh dataset.gedi_context.enabled=false
+```
+
+Spatial splits stay unchanged. Within each split, a deterministic hash of the
+exact int64 shot ID and `dataset.gedi_context.seed` selects context shots;
+all remaining eligible shots become labels. A shot keeps the same role across
+pixels, patches and periods. Increasing the fraction adds context shots to the
+existing subset. Fractions are approximate across shots, not exact per patch
+or weighted by footprint pixel counts. Missing/zero shot IDs are excluded when
+context is enabled and their pixel counts are recorded in `data_summary.json`.
+
+The loader appends AGBD context divided by the training-query target scale and
+a binary context mask, giving 16 model channels without changing the 14-band
+files on disk. Missing context is zero; a context AGBD of zero is distinguished
+by the mask. Only non-context labels contribute to loss, metrics, target scale
+and the mean baseline. Sentinel normalization still uses training inputs only.
+Validation/test also receive their own context subset, with their label shots
+hidden. The analysis and checkpoint-evaluation commands reuse this protocol.
+
+Changing the fraction also changes the remaining label set. Compare runs on
+common label shots for a controlled comparison across fractions. Enabling the
+experiment with fraction zero gives the 16-channel zero-context control;
+disabling it restores the original 14-channel behavior.
+
 ```bash
 python main.py
 # Optionally evaluate the best validation checkpoint on test:
